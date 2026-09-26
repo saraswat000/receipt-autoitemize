@@ -1,0 +1,12 @@
+MERCHANT: Hotel Shop
+DATE: 2026-03-13
+CURRENCY: EUR
+
+Water                       4.00
+Snacks                      6.00
+
+Subtotal                   10.00
+VAT 19%                     1.90
+TOTAL                      18.50
+
+(Line items do not sum to total)

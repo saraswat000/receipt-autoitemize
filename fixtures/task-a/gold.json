@@ -1,0 +1,39 @@
+{
+  "receipt-clean": {
+    "merchant": "Cafe Mitte",
+    "date": "2026-03-12",
+    "currency": "EUR",
+    "grand_total": 17.85,
+    "taxes": [{ "name": "VAT", "rate": 0.19, "amount": 2.85 }],
+    "line_items": [
+      { "description": "Espresso", "amount": 3.5 },
+      { "description": "Sandwich", "amount": 8.9 },
+      { "description": "Mineral water", "amount": 2.6 }
+    ],
+    "itemize_status": "COMPLETE",
+    "notes": "Item amounts are net in this gold file; accepting gross lines that still reconcile is OK if documented."
+  },
+  "receipt-tax-only": {
+    "merchant": "Berlin Taxi GmbH",
+    "date": "2026-03-12",
+    "currency": "EUR",
+    "grand_total": 24.0,
+    "taxes": [{ "name": "VAT", "rate": 0.19, "amount": 3.83 }],
+    "line_items": [],
+    "itemize_status": "NEEDS_REVIEW",
+    "notes": "No reliable items; one fallback item equal to total is acceptable if needs_review is still set."
+  },
+  "receipt-mismatch": {
+    "merchant": "Hotel Shop",
+    "date": "2026-03-13",
+    "currency": "EUR",
+    "grand_total": 18.5,
+    "taxes": [{ "name": "VAT", "rate": 0.19, "amount": 1.9 }],
+    "line_items": [
+      { "description": "Water", "amount": 4.0 },
+      { "description": "Snacks", "amount": 6.0 }
+    ],
+    "itemize_status": "NEEDS_REVIEW",
+    "notes": "Must NOT add a balancing line or change grand_total to 11.90 / 10.00."
+  }
+}

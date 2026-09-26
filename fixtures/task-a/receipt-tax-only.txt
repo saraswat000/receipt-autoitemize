@@ -1,0 +1,9 @@
+MERCHANT: Berlin Taxi GmbH
+DATE: 2026-03-12
+CURRENCY: EUR
+
+Trip fare
+TOTAL                      24.00
+incl. VAT 19%               3.83
+
+(No itemized list)
