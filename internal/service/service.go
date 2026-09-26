@@ -43,6 +43,7 @@ type Service struct {
 	ocr        ocr.Engine
 	uploadsDir string
 	now        func() time.Time
+	queue      Queue // nil = synchronous processing
 }
 
 func New(st *store.Store, engine ocr.Engine, uploadsDir string) *Service {
@@ -145,20 +146,33 @@ func (s *Service) GetReceipt(ctx context.Context, id string) (ReceiptView, error
 
 // ---------------------------------------------------------------- process
 
-// Process runs OCR + extraction + auto-itemize and creates (or, on re-process, updates)
-// the receipt's single transaction.
+// Process runs OCR + extraction + auto-itemize synchronously and creates (or, on
+// re-process, updates) the receipt's single transaction.
 func (s *Service) Process(ctx context.Context, receiptID string) (domain.Transaction, error) {
+	txnID, err := s.processOnce(ctx, receiptID)
+	if err != nil {
+		if errors.Is(err, ErrOCRFailed) {
+			if markErr := s.store.MarkReceiptFailed(ctx, receiptID, err.Error(), s.now()); markErr != nil {
+				return domain.Transaction{}, markErr
+			}
+		}
+		return domain.Transaction{}, err
+	}
+	return s.GetTransaction(ctx, txnID)
+}
+
+// processOnce is one attempt: OCR, extract, reconcile, save atomically. It is
+// idempotent (the save is an upsert on receipt_id), so the async worker can retry it.
+// It does not record failures; the caller decides whether a failure is final.
+func (s *Service) processOnce(ctx context.Context, receiptID string) (string, error) {
 	r, err := s.store.GetReceipt(ctx, receiptID)
 	if err != nil {
-		return domain.Transaction{}, mapStoreErr(err)
+		return "", mapStoreErr(err)
 	}
 
 	text, err := s.ocr.ExtractText(ctx, ocr.Input{Path: r.StoragePath, Filename: r.Filename, ContentType: r.ContentType})
 	if err != nil {
-		if markErr := s.store.MarkReceiptFailed(ctx, r.ID, err.Error(), s.now()); markErr != nil {
-			return domain.Transaction{}, markErr
-		}
-		return domain.Transaction{}, fmt.Errorf("%w: %v", ErrOCRFailed, err)
+		return "", &ocrError{err: err}
 	}
 
 	now := s.now()
@@ -173,7 +187,7 @@ func (s *Service) Process(ctx context.Context, receiptID string) (domain.Transac
 		h.Taxes[i].ID = NewID("tax")
 	}
 
-	txnID, err := s.store.SaveProcessed(ctx, ocrResult, domain.Transaction{
+	return s.store.SaveProcessed(ctx, ocrResult, domain.Transaction{
 		ID:            NewID("txn"), // ignored when the receipt already has a transaction
 		ReceiptID:     r.ID,
 		Merchant:      h.Merchant,
@@ -188,11 +202,15 @@ func (s *Service) Process(ctx context.Context, receiptID string) (domain.Transac
 		CreatedAt:     now,
 		UpdatedAt:     now,
 	})
-	if err != nil {
-		return domain.Transaction{}, err
-	}
-	return s.GetTransaction(ctx, txnID)
 }
+
+// ocrError wraps an engine failure so callers can match ErrOCRFailed and still reach
+// the engine's own error (e.g. ocr.ErrNoText) with errors.Is.
+type ocrError struct{ err error }
+
+func (e *ocrError) Error() string        { return fmt.Sprintf("%v: %v", ErrOCRFailed, e.err) }
+func (e *ocrError) Is(target error) bool { return target == ErrOCRFailed }
+func (e *ocrError) Unwrap() error        { return e.err }
 
 func (s *Service) GetTransaction(ctx context.Context, id string) (domain.Transaction, error) {
 	t, err := s.store.GetTransaction(ctx, id)

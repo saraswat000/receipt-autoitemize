@@ -6,9 +6,10 @@ import "time"
 type ReceiptStatus string
 
 const (
-	ReceiptUploaded  ReceiptStatus = "UPLOADED"
-	ReceiptProcessed ReceiptStatus = "PROCESSED"
-	ReceiptFailed    ReceiptStatus = "OCR_FAILED"
+	ReceiptUploaded   ReceiptStatus = "UPLOADED"
+	ReceiptProcessing ReceiptStatus = "PROCESSING" // queued or running (async mode)
+	ReceiptProcessed  ReceiptStatus = "PROCESSED"
+	ReceiptFailed     ReceiptStatus = "OCR_FAILED"
 )
 
 // ItemizeStatus says whether the line items can be trusted.

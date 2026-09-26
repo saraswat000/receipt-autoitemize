@@ -7,12 +7,13 @@ CREATE TABLE IF NOT EXISTS receipts (
     size_bytes    INTEGER NOT NULL,
     sha256        TEXT    NOT NULL,
     storage_path  TEXT    NOT NULL,
-    status        TEXT    NOT NULL CHECK (status IN ('UPLOADED', 'PROCESSED', 'OCR_FAILED')),
+    status        TEXT    NOT NULL CHECK (status IN ('UPLOADED', 'PROCESSING', 'PROCESSED', 'OCR_FAILED')),
     ocr_error     TEXT,
     created_at    TEXT    NOT NULL,
     processed_at  TEXT
 );
 CREATE INDEX IF NOT EXISTS receipts_sha256 ON receipts (sha256);
+CREATE INDEX IF NOT EXISTS receipts_status ON receipts (status); -- startup recovery scans PROCESSING
 
 -- Every OCR run is kept; the newest row per receipt is the source for re-itemize.
 CREATE TABLE IF NOT EXISTS ocr_results (

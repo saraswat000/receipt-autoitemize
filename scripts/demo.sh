@@ -17,7 +17,14 @@ for name in receipt-clean receipt-tax-only receipt-mismatch; do
   RID=$(curl -sS -F "file=@$FIX/$name.txt" "$BASE/receipts" | tee /dev/stderr | jq -r .receipt_id)
 
   step "POST /receipts/$RID/process"
-  TXN[$name]=$(curl -sS -X POST "$BASE/receipts/$RID/process" \
+  OUT=$(curl -sS -X POST "$BASE/receipts/$RID/process")
+  if [ "$(jq -r 'has("receipt_id") and (has("line_items") | not)' <<<"$OUT")" = true ]; then
+    # Async mode: 202 with the receipt; poll until a worker has processed it.
+    echo "202 Accepted, status $(jq -r .status <<<"$OUT"); polling GET /receipts/$RID ..." >&2
+    until [ "$(curl -sS "$BASE/receipts/$RID" | jq -r .status)" != PROCESSING ]; do sleep 0.2; done
+    OUT=$(curl -sS "$BASE/transactions/$(curl -sS "$BASE/receipts/$RID" | jq -r .transaction_id)")
+  fi
+  TXN[$name]=$(echo "$OUT" \
     | jq -c '{id, merchant, date, currency, grand_total, taxes: [.taxes[] | {name, rate, amount, inclusive}],
               line_items: [.line_items[] | {description, amount}], itemize_status, itemize_issues}' \
     | tee /dev/stderr | jq -r .id)

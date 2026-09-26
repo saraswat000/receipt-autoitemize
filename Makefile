@@ -1,7 +1,10 @@
-.PHONY: run test lint demo docker clean
+.PHONY: run run-async test lint demo docker clean
 
 run: ## Start the API on :8080 (data in ./data)
 	go run ./cmd/server
+
+run-async: ## Same, but process returns 202 and a goroutine worker pool runs OCR
+	PROCESS_MODE=async go run ./cmd/server
 
 test: ## Unit, golden and end-to-end HTTP tests with the race detector
 	go test -race -count=1 ./...

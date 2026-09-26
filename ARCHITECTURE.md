@@ -4,9 +4,9 @@
 
 ```
 HTTP (internal/api) ──> service (use cases) ──> store (SQLite)
-                                  │
-                                  ├──> ocr.Engine        (stub today, vendor later)
-                                  ├──> extract           (pure: text -> header, taxes, items)
+                          ▲       │
+  worker.Pool (async) ────┘       ├──> ocr.Engine        (stub today, vendor later)
+  bounded goroutines              ├──> extract           (pure: text -> header, taxes, items)
                                   └──> itemize           (pure: reconcile rules, PATCH operations)
 ```
 
@@ -36,12 +36,14 @@ receipts 1 ── 1 transactions         UNIQUE(receipt_id): one transaction per
 | Process is atomic (OCR row, header, taxes, items) | a single SQL transaction in `store.SaveProcessed` |
 | Re-itemize and PATCH change items only, never header or taxes | `store.ReplaceItems` only touches `line_items` and the itemize status |
 | The total is never adjusted and no balancing line is invented | `itemize.Reconcile` only reports; PATCH returns 409 and writes nothing |
+| A crash never loses an accepted async job | `PROCESSING` is written before the hand-off; recovery re-queues on start |
+| Duplicate `/process` calls run OCR once | a conditional claim (`MarkProcessing`) inside one SQL transaction |
 | No lost updates | `UPDATE … WHERE version = ?`, plus an optional `If-Match` that returns 412 |
 | File type is trusted from the bytes, not the header | `http.DetectContentType` together with an allow-list |
 
 ## Tradeoffs made for scope
 
-- **Synchronous processing.** Processing with the stub is instant. A real OCR or VLM call takes seconds and can fail, so production would make `process` return `202` with a job ID and let workers retry with backoff and set the receipt status. The status fields already exist for that.
+- **Processing is sync by default and async on request.** `PROCESS_MODE=async` returns `202` and runs OCR on a bounded goroutine pool. It includes per-attempt timeouts, retries with backoff for transient errors, and `503` backpressure when the queue is full. The database is the durable queue: receipts are marked `PROCESSING` before they are handed to the channel, and startup recovery re-queues any left behind. The pool is per process, so with several replicas the channel becomes SQS or Kafka and the workers become their own deployment. The job code stays the same because it is already idempotent.
 - **Local disk and SQLite.** One connection serialises writes. Production would use object storage (S3 with content-addressed keys) and Postgres. The store package is the only code that would change.
 - **A regex parser over labelled text.** It is deliberately simple and deterministic. A real pipeline would put a VLM that returns structured JSON with a confidence score per field behind `ocr.Engine`. Low confidence would map to `NEEDS_REVIEW` just like a total mismatch does today. The reconciliation rules would stay the same and act as the guardrail on model output.
 - **Re-itemize overwrites user edits** because the brief asks for that. Items carry `source`, so a future `?preserve_user_edits=true` would be simple to add.

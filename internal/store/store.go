@@ -115,6 +115,54 @@ func (s *Store) MarkReceiptFailed(ctx context.Context, id, reason string, at tim
 	return err
 }
 
+// MarkProcessing atomically moves a receipt to PROCESSING unless it already is, and
+// returns the status it had before. claimed is false when another request already
+// queued it, which is how duplicate process calls are collapsed into one job.
+func (s *Store) MarkProcessing(ctx context.Context, id string) (prev domain.ReceiptStatus, claimed bool, err error) {
+	err = s.inTx(ctx, func(tx *sql.Tx) error {
+		if err := tx.QueryRowContext(ctx, `SELECT status FROM receipts WHERE id = ?`, id).Scan(&prev); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return ErrNotFound
+			}
+			return err
+		}
+		if prev == domain.ReceiptProcessing {
+			return nil
+		}
+		claimed = true
+		_, err := tx.ExecContext(ctx,
+			`UPDATE receipts SET status = 'PROCESSING', ocr_error = NULL WHERE id = ?`, id)
+		return err
+	})
+	return prev, claimed, err
+}
+
+// RestoreStatus undoes MarkProcessing when the job could not be queued.
+func (s *Store) RestoreStatus(ctx context.Context, id string, status domain.ReceiptStatus) error {
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE receipts SET status = ? WHERE id = ? AND status = 'PROCESSING'`, status, id)
+	return err
+}
+
+// PendingReceipts lists receipts left in PROCESSING, e.g. by a crash or shutdown.
+func (s *Store) PendingReceipts(ctx context.Context) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id FROM receipts WHERE status = 'PROCESSING' ORDER BY created_at, id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
 // LatestOCR returns the newest OCR result for a receipt.
 func (s *Store) LatestOCR(ctx context.Context, receiptID string) (domain.OCRResult, error) {
 	return s.ocrWhere(ctx, `receipt_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1`, receiptID)

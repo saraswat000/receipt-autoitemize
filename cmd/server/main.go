@@ -7,11 +7,17 @@
 //	FIXTURES_DIR    stub OCR fixture texts     (default "./fixtures/task-a")
 //	MAX_UPLOAD_MB   upload size limit          (default 10)
 //	LOG_FORMAT      "json" or "text"           (default "text")
+//	PROCESS_MODE    "sync" or "async"          (default "sync")
+//	OCR_WORKERS     async: concurrent OCR jobs (default 4)
+//	OCR_QUEUE_SIZE  async: jobs that may wait  (default 100)
+//	OCR_TIMEOUT     async: per-attempt timeout (default "30s")
+//	OCR_MAX_ATTEMPTS async: tries per job      (default 3)
 package main
 
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -25,6 +31,7 @@ import (
 	"receipt-autoitemize/internal/ocr"
 	"receipt-autoitemize/internal/service"
 	"receipt-autoitemize/internal/store"
+	"receipt-autoitemize/internal/worker"
 )
 
 func main() {
@@ -64,6 +71,32 @@ func run() error {
 	defer st.Close()
 
 	svc := service.New(st, ocr.StubEngine{FixturesDir: fixturesDir}, uploadsDir)
+
+	var pool *worker.Pool
+	switch mode := env("PROCESS_MODE", "sync"); mode {
+	case "sync":
+	case "async":
+		cfg, err := workerConfig()
+		if err != nil {
+			return err
+		}
+		pool = worker.New(cfg, svc.WorkerHandler(), log)
+		pool.Start()
+		svc.UseQueue(pool)
+		// Receipts left PROCESSING by a crash are re-queued in the background, so a
+		// large backlog does not delay the server from accepting requests.
+		go func() {
+			n, err := svc.RecoverPending(ctx)
+			if err != nil {
+				log.Error("recovery stopped", "requeued", n, "err", err)
+				return
+			}
+			log.Info("recovery done", "requeued", n)
+		}()
+		log.Info("async processing", "workers", cfg.Workers, "queue_size", cfg.QueueSize)
+	default:
+		return fmt.Errorf("PROCESS_MODE must be sync or async, got %q", mode)
+	}
 	srv := &http.Server{
 		Addr:              addr,
 		Handler:           api.New(svc, log, maxUploadMB<<20).Handler(),
@@ -88,9 +121,35 @@ func run() error {
 		log.Info("shutting down")
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		return srv.Shutdown(shutdownCtx)
+		// Stop HTTP first so no new jobs arrive, then drain the workers.
+		err := srv.Shutdown(shutdownCtx)
+		if pool != nil {
+			if perr := pool.Shutdown(shutdownCtx); perr != nil {
+				log.Warn("workers did not finish in time; unfinished receipts stay PROCESSING and resume on restart")
+			}
+		}
+		return err
 	}
 	return nil
+}
+
+func workerConfig() (worker.Config, error) {
+	var cfg worker.Config
+	var err error
+	if cfg.Workers, err = strconv.Atoi(env("OCR_WORKERS", "4")); err != nil || cfg.Workers < 1 {
+		return cfg, errors.New("OCR_WORKERS must be a positive integer")
+	}
+	if cfg.QueueSize, err = strconv.Atoi(env("OCR_QUEUE_SIZE", "100")); err != nil || cfg.QueueSize < 1 {
+		return cfg, errors.New("OCR_QUEUE_SIZE must be a positive integer")
+	}
+	if cfg.JobTimeout, err = time.ParseDuration(env("OCR_TIMEOUT", "30s")); err != nil || cfg.JobTimeout <= 0 {
+		return cfg, errors.New("OCR_TIMEOUT must be a duration such as 30s")
+	}
+	if cfg.MaxAttempts, err = strconv.Atoi(env("OCR_MAX_ATTEMPTS", "3")); err != nil || cfg.MaxAttempts < 1 {
+		return cfg, errors.New("OCR_MAX_ATTEMPTS must be a positive integer")
+	}
+	cfg.Backoff = time.Second
+	return cfg, nil
 }
 
 func env(key, def string) string {

@@ -97,8 +97,20 @@ func (s *Server) getReceipt(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) processReceipt(w http.ResponseWriter, r *http.Request) {
-	t, err := s.svc.Process(r.Context(), r.PathValue("id"))
-	s.respondTxn(w, r, t, err)
+	id := r.PathValue("id")
+	if !s.svc.Async() {
+		t, err := s.svc.Process(r.Context(), id)
+		s.respondTxn(w, r, t, err)
+		return
+	}
+	// Async mode: accept the job and let the client poll the receipt.
+	v, err := s.svc.ProcessAsync(r.Context(), id)
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	w.Header().Set("Location", "/receipts/"+id)
+	writeJSON(w, http.StatusAccepted, v)
 }
 
 func (s *Server) getTransaction(w http.ResponseWriter, r *http.Request) {
@@ -186,6 +198,10 @@ func (s *Server) fail(w http.ResponseWriter, r *http.Request, err error) {
 		s.writeError(w, r, http.StatusUnsupportedMediaType, "UNSUPPORTED_MEDIA_TYPE", err.Error(), nil)
 	case errors.Is(err, service.ErrEmptyFile):
 		s.writeError(w, r, http.StatusBadRequest, "EMPTY_FILE", "uploaded file is empty", nil)
+	case errors.Is(err, service.ErrQueueFull):
+		w.Header().Set("Retry-After", "5")
+		s.writeError(w, r, http.StatusServiceUnavailable, "QUEUE_FULL",
+			"too many receipts are waiting for OCR; retry shortly", nil)
 	case errors.Is(err, service.ErrOCRFailed):
 		s.writeError(w, r, http.StatusUnprocessableEntity, "OCR_FAILED", err.Error(), nil)
 	case errors.As(err, &opErr):

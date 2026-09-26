@@ -10,6 +10,7 @@ Requires Go 1.25+ (older Go toolchains download 1.25 automatically).
 
 ```bash
 make run          # or: go run ./cmd/server
+make run-async    # same, but OCR runs on a goroutine worker pool (see "Async processing")
 ```
 
 The server listens on `:8080` and keeps SQLite and uploaded files in `./data`. To use Docker instead: `make docker`.
@@ -26,6 +27,11 @@ make demo         # with the server running: walks every endpoint on the 3 fixtu
 | `FIXTURES_DIR` | `./fixtures/task-a` | text used by the stub OCR |
 | `MAX_UPLOAD_MB` | `10` | upload size limit |
 | `LOG_FORMAT` | `text` | `json` for structured logs |
+| `PROCESS_MODE` | `sync` | `async` returns `202` from `/process` and runs OCR on a worker pool |
+| `OCR_WORKERS` | `4` | async: OCR jobs running at once (caps vendor concurrency) |
+| `OCR_QUEUE_SIZE` | `100` | async: jobs that may wait before `/process` answers `503` |
+| `OCR_TIMEOUT` | `30s` | async: timeout per attempt |
+| `OCR_MAX_ATTEMPTS` | `3` | async: attempts per job, with exponential backoff from 1s |
 
 ## API and example curls
 
@@ -83,6 +89,13 @@ The mismatch fixture keeps its total and its two items and explains the problem:
 ```
 
 Errors: `404` for an unknown receipt, and `422 OCR_FAILED` when the stub has no text for the file. In that case the receipt is marked `OCR_FAILED`.
+
+In async mode (`PROCESS_MODE=async`) this returns **`202 Accepted`** with the receipt (`"status": "PROCESSING"`) and a `Location: /receipts/{id}` header. Poll that URL until the status is `PROCESSED` (then `transaction_id` is set) or `OCR_FAILED`. Calling it again while the receipt is `PROCESSING` returns 202 without queuing a second job. When the queue is full it returns `503 QUEUE_FULL` with `Retry-After`, and the receipt keeps its previous status.
+
+```bash
+curl -si -X POST localhost:8080/receipts/$RID/process     # async: HTTP/1.1 202 Accepted
+curl -s localhost:8080/receipts/$RID | jq '{status, transaction_id}'
+```
 
 ### `GET /receipts/{id}`
 
@@ -161,6 +174,19 @@ A tax-only receipt can be resolved by the user, for example:
 
 These results are asserted against `gold.json` in `internal/extract/extract_test.go` (parser level) and `internal/api/api_test.go` (over HTTP).
 
+## Async processing
+
+With the stub, OCR is instant, so sync is the default and the brief's curls return the transaction directly. A real OCR or vision-model call takes seconds and sometimes fails, so `PROCESS_MODE=async` moves it off the request path:
+
+- `/process` atomically marks the receipt `PROCESSING` in the database and hands its ID to a buffered channel. A **fixed pool** of `OCR_WORKERS` goroutines reads the channel, which caps concurrent vendor calls.
+- Each attempt runs with a timeout. Transient errors are retried with exponential backoff; permanent ones (the file has no readable text) fail at once and mark the receipt `OCR_FAILED`.
+- **The database is the durable queue, and the channel is only a hand-off.** On startup, every receipt still in `PROCESSING` (left by a crash or an unfinished shutdown) is re-queued.
+- **The save is idempotent** (an upsert on `receipt_id`), so a job that runs twice still yields one transaction. A duplicate `/process` call doesn't queue a second job, because claiming the receipt is a single conditional update.
+- **Backpressure:** a full queue returns `503` with `Retry-After` instead of blocking or starting unbounded goroutines.
+- **Graceful shutdown:** HTTP stops first, then workers finish the jobs they are running within the deadline. Queued jobs stay `PROCESSING` and resume on the next start.
+
+This scales within one process. With several API replicas, each would have its own in-memory channel, so the next step is an external queue (SQS or Kafka) with separate worker processes. The worker code doesn't change, because it already assumes at-least-once delivery.
+
 ## Decisions and assumptions
 
 - **Items are net.** An item amount excludes added-on tax, which matches `gold.json`. The reconciliation rule is `sum(items) + sum(non-inclusive taxes) == grand_total` with a tolerance of 1 cent. Inclusive taxes such as "incl. VAT" are already inside the prices, so they are not added.
@@ -180,6 +206,7 @@ internal/extract    OCR text -> header, taxes, proposed items (pure)
 internal/itemize    Reconcile rules + PATCH operations (pure)
 internal/service    use cases: upload, process, re-itemize, patch
 internal/store      SQLite (schema.sql embedded), transactional writes
+internal/worker     bounded goroutine pool: retries, timeouts, graceful shutdown
 internal/api        HTTP handlers, error mapping, middleware
 fixtures/task-a     brief fixtures + gold.json
 ```
