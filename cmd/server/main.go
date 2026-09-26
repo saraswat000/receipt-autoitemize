@@ -73,13 +73,27 @@ func run() error {
 	}
 	defer repo.Close()
 
-	svc := service.New(repo, ocr.StubEngine{FixturesDir: fixturesDir}, uploadsDir)
+	ocrTimeout, err := time.ParseDuration(env("OCR_TIMEOUT", "30s"))
+	if err != nil || ocrTimeout <= 0 {
+		return errors.New("OCR_TIMEOUT must be a duration such as 30s")
+	}
+	cacheSize, err := strconv.Atoi(env("OCR_CACHE_SIZE", "1000"))
+	if err != nil || cacheSize < 0 {
+		return errors.New("OCR_CACHE_SIZE must be zero or a positive integer")
+	}
+	// The stub is decorated exactly as a real vendor engine would be.
+	engine := ocr.Chain(ocr.StubEngine{FixturesDir: fixturesDir},
+		ocr.WithLogging(log),        // outermost: sees cache hits and failures
+		ocr.WithCache(cacheSize),    // a hit skips the timeout and the vendor
+		ocr.WithTimeout(ocrTimeout), // innermost: bounds the real call
+	)
+	svc := service.New(repo, engine, uploadsDir)
 
 	var pool *worker.Pool
 	switch mode := env("PROCESS_MODE", "sync"); mode {
 	case "sync":
 	case "async":
-		cfg, err := workerConfig()
+		cfg, err := workerConfig(ocrTimeout)
 		if err != nil {
 			return err
 		}
@@ -149,7 +163,7 @@ func openRepository(ctx context.Context, kind, dataDir string) (repository.Repos
 	}
 }
 
-func workerConfig() (worker.Config, error) {
+func workerConfig(jobTimeout time.Duration) (worker.Config, error) {
 	var cfg worker.Config
 	var err error
 	if cfg.Workers, err = strconv.Atoi(env("OCR_WORKERS", "4")); err != nil || cfg.Workers < 1 {
@@ -158,9 +172,7 @@ func workerConfig() (worker.Config, error) {
 	if cfg.QueueSize, err = strconv.Atoi(env("OCR_QUEUE_SIZE", "100")); err != nil || cfg.QueueSize < 1 {
 		return cfg, errors.New("OCR_QUEUE_SIZE must be a positive integer")
 	}
-	if cfg.JobTimeout, err = time.ParseDuration(env("OCR_TIMEOUT", "30s")); err != nil || cfg.JobTimeout <= 0 {
-		return cfg, errors.New("OCR_TIMEOUT must be a duration such as 30s")
-	}
+	cfg.JobTimeout = jobTimeout
 	if cfg.MaxAttempts, err = strconv.Atoi(env("OCR_MAX_ATTEMPTS", "3")); err != nil || cfg.MaxAttempts < 1 {
 		return cfg, errors.New("OCR_MAX_ATTEMPTS must be a positive integer")
 	}

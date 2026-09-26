@@ -5,12 +5,14 @@
 ```
 HTTP (internal/api) ──> service (use cases) ──> repository (interface) ──> sqlite | memory
                           ▲       │
-  worker.Pool (async) ────┘       ├──> ocr.Engine        (stub today, vendor later)
+  worker.Pool (async) ────┘       ├──> ocr.Engine        (logging -> cache -> timeout -> stub; vendor later)
   bounded goroutines              ├──> extract           (pure: text -> header, taxes, items)
                                   └──> itemize           (pure: reconcile rules, PATCH operations)
 ```
 
 The domain rules live in `extract` and `itemize`. Both are pure functions with no I/O, clock or IDs, so they are tested directly against `gold.json`. The service layer orchestrates, and it depends on the `repository.Repository` interface, not a database. Implementations own atomicity and must pass the shared `repotest` contract suite. The HTTP layer only decodes requests and maps errors.
+
+Two extension points are built as patterns so they grow without edits to the core. The OCR engine is wrapped by decorators (`ocr.Chain`): logging, an LRU cache keyed by file hash, and a timeout. A real vendor engine drops in underneath and inherits all three, and a circuit breaker or rate limiter would be one more decorator. PATCH operations are commands: each op type implements `Execute` on a working copy, and a registry maps the wire name to the type, so `Apply` stays a short loop that keeps the all-or-nothing guarantee.
 
 ## Data model
 

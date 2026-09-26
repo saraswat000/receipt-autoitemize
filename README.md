@@ -31,7 +31,8 @@ make demo         # with the server running: walks every endpoint on the 3 fixtu
 | `PROCESS_MODE` | `sync` | `async` returns `202` from `/process` and runs OCR on a worker pool |
 | `OCR_WORKERS` | `4` | async: OCR jobs running at once (caps vendor concurrency) |
 | `OCR_QUEUE_SIZE` | `100` | async: jobs that may wait before `/process` answers `503` |
-| `OCR_TIMEOUT` | `30s` | async: timeout per attempt |
+| `OCR_TIMEOUT` | `30s` | timeout per OCR call (and per async attempt) |
+| `OCR_CACHE_SIZE` | `1000` | OCR results kept in an LRU keyed by file hash; `0` turns it off |
 | `OCR_MAX_ATTEMPTS` | `3` | async: attempts per job, with exponential backoff from 1s |
 
 ## API and example curls
@@ -199,6 +200,25 @@ With the stub, OCR is instant, so sync is the default and the brief's curls retu
 
 This scales within one process. With several API replicas, each would have its own in-memory channel, so the next step is an external queue (SQS or Kafka) with separate worker processes. The worker code doesn't change, because it already assumes at-least-once delivery.
 
+## Design patterns
+
+Each pattern is here because it solves a problem in this code, not for show.
+
+| Pattern | Where | What it buys |
+|---|---|---|
+| Repository | `internal/repository` | The service never sees a database; backends are swappable and share one contract suite |
+| Strategy | `ocr.Engine`, `repository.Repository` | Stub OCR today, a vendor or VLM tomorrow; SQLite or memory chosen at start |
+| Decorator | `ocr.Chain` with `WithLogging`, `WithCache`, `WithTimeout` (`internal/ocr/middleware.go`) | Cross-cutting concerns around the vendor call without touching the engine or the service |
+| Command | PATCH operations (`internal/itemize/ops.go`) | Each op is its own type with `Execute`; a registry decodes them, so a new op is a new type, not a longer switch |
+| Factory | `openRepository` in `cmd/server` | The only place that knows which database is used |
+| Adapter | `Service.WorkerHandler()` | Plugs service use cases into the generic `worker.Pool` without the pool importing the service |
+| Producer–consumer / worker pool | `internal/worker` | Bounded concurrency, backpressure, retries |
+| Chain of responsibility | HTTP middleware (`internal/api/middleware.go`) | Request ID, panic recovery and access log wrap every handler |
+| Value object | `domain.Money`, `domain.Rate` | Exact integer arithmetic; parsing and JSON in one place |
+| Optimistic locking | `version` column, `ETag`/`If-Match` | No lost updates without holding locks |
+
+Considered and left out: a state machine for receipt status (almost every transition is legal, since a receipt can be re-processed from any state, so a table would add code and catch nothing), and Specification objects for reconciliation (three short rules read better as one function).
+
 ## Decisions and assumptions
 
 - **Items are net.** An item amount excludes added-on tax, which matches `gold.json`. The reconciliation rule is `sum(items) + sum(non-inclusive taxes) == grand_total` with a tolerance of 1 cent. Inclusive taxes such as "incl. VAT" are already inside the prices, so they are not added.
@@ -213,9 +233,9 @@ This scales within one process. With several API replicas, each would have its o
 ```
 cmd/server          wiring, config, graceful shutdown
 internal/domain     Money, Rate, Receipt, Transaction, TaxLine, LineItem, statuses
-internal/ocr        Engine interface + StubEngine
+internal/ocr        Engine interface, StubEngine, decorators (timeout, cache, logging)
 internal/extract    OCR text -> header, taxes, proposed items (pure)
-internal/itemize    Reconcile rules + PATCH operations (pure)
+internal/itemize    Reconcile rules + PATCH operations as commands (pure)
 internal/service    use cases: upload, process, re-itemize, patch
 internal/repository persistence contract (interfaces + errors) the service depends on
   ├─ sqlite         SQLite implementation (schema.sql embedded), transactional writes

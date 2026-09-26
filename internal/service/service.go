@@ -171,7 +171,7 @@ func (s *Service) processOnce(ctx context.Context, receiptID string) (string, er
 		return "", mapStoreErr(err)
 	}
 
-	text, err := s.ocr.ExtractText(ctx, ocr.Input{Path: r.StoragePath, Filename: r.Filename, ContentType: r.ContentType})
+	text, err := s.ocr.ExtractText(ctx, ocr.Input{Path: r.StoragePath, Filename: r.Filename, ContentType: r.ContentType, SHA256: r.SHA256})
 	if err != nil {
 		return "", &ocrError{err: err}
 	}

@@ -30,6 +30,7 @@ type Input struct {
 	Path        string // local path of the stored upload
 	Filename    string // original client file name
 	ContentType string // sniffed content type
+	SHA256      string // hex hash of the file bytes; lets decorators key on content
 }
 
 // Engine extracts raw text from a receipt file.

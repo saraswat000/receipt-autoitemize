@@ -43,143 +43,204 @@ type OpError struct {
 
 func (e *OpError) Error() string { return fmt.Sprintf("operation %d: %s", e.Index, e.Message) }
 
+// Command is one executable edit. Each op in the request decodes into its own
+// Command type (the Command pattern), so adding an op means adding a type and a
+// registry entry, and Apply never grows.
+type Command interface {
+	Execute(w *worksheet) error
+}
+
+// commands maps the wire name of an op to the constructor of its Command.
+var commands = map[string]func(Operation) Command{
+	"update": func(o Operation) Command { return updateCmd(o) },
+	"merge":  func(o Operation) Command { return mergeCmd(o) },
+	"split":  func(o Operation) Command { return splitCmd(o) },
+	"add":    func(o Operation) Command { return addCmd(o) },
+	"delete": func(o Operation) Command { return deleteCmd(o) },
+}
+
+// Command decodes the operation into its executable form.
+func (o Operation) Command() (Command, error) {
+	mk, ok := commands[o.Op]
+	if !ok {
+		return nil, opFail("UNKNOWN_OP", "unknown op %q (want update, merge, split, add, delete)", o.Op)
+	}
+	return mk(o), nil
+}
+
+// worksheet is the working copy the commands edit.
+type worksheet struct {
+	items []domain.LineItem
+	newID func() string
+}
+
+func (w *worksheet) find(id string) (int, error) {
+	for i, it := range w.items {
+		if it.ID == id {
+			return i, nil
+		}
+	}
+	return -1, opFail("UNKNOWN_ITEM", "no line item %q on this transaction", id)
+}
+
 // Apply runs the operations in order on a copy of items and returns the result.
 // It is all-or-nothing: the first invalid operation aborts with an *OpError and the
 // input slice is never modified. newID mints IDs for items created by merge/split/add.
 func Apply(items []domain.LineItem, ops []Operation, newID func() string) ([]domain.LineItem, error) {
-	out := make([]domain.LineItem, len(items))
-	copy(out, items)
-
+	w := &worksheet{items: append([]domain.LineItem(nil), items...), newID: newID}
+	if w.items == nil {
+		w.items = []domain.LineItem{}
+	}
 	for n, op := range ops {
-		fail := func(code, format string, args ...any) error {
-			return &OpError{Index: n, Code: code, Message: fmt.Sprintf(format, args...)}
+		cmd, err := op.Command()
+		if err == nil {
+			err = cmd.Execute(w)
 		}
-		find := func(id string) (int, error) {
-			for i, it := range out {
-				if it.ID == id {
-					return i, nil
-				}
+		if err != nil {
+			if oe, ok := err.(*OpError); ok {
+				oe.Index = n
 			}
-			return -1, fail("UNKNOWN_ITEM", "no line item %q on this transaction", id)
-		}
-		validDesc := func(d *string) bool { return d != nil && strings.TrimSpace(*d) != "" }
-
-		switch op.Op {
-		case "update":
-			i, err := find(op.ItemID)
-			if err != nil {
-				return nil, err
-			}
-			if op.Description == nil && op.Amount == nil && op.Quantity == nil && op.TaxAmount == nil {
-				return nil, fail("EMPTY_UPDATE", "update needs at least one of description, amount, quantity, tax_amount")
-			}
-			if op.Description != nil {
-				if !validDesc(op.Description) {
-					return nil, fail("INVALID_DESCRIPTION", "description must not be empty")
-				}
-				out[i].Description = strings.TrimSpace(*op.Description)
-			}
-			if op.Amount != nil {
-				out[i].Amount = *op.Amount
-			}
-			if op.Quantity != nil {
-				out[i].Quantity = op.Quantity
-			}
-			if op.TaxAmount != nil {
-				out[i].TaxAmount = op.TaxAmount
-			}
-			out[i].Source = domain.SourceUser
-
-		case "merge":
-			if len(op.ItemIDs) < 2 {
-				return nil, fail("INVALID_MERGE", "merge needs at least two item_ids")
-			}
-			if !validDesc(op.Description) {
-				return nil, fail("INVALID_DESCRIPTION", "merge needs a description")
-			}
-			seen := map[string]bool{}
-			var idx []int
-			var sum domain.Money
-			var tax *domain.Money
-			for _, id := range op.ItemIDs {
-				if seen[id] {
-					return nil, fail("DUPLICATE_ITEM", "item %q listed twice", id)
-				}
-				seen[id] = true
-				i, err := find(id)
-				if err != nil {
-					return nil, err
-				}
-				idx = append(idx, i)
-				sum += out[i].Amount
-				if out[i].TaxAmount != nil {
-					t := *out[i].TaxAmount
-					if tax != nil {
-						t += *tax
-					}
-					tax = &t
-				}
-			}
-			if op.Amount != nil {
-				sum = *op.Amount
-			}
-			merged := domain.LineItem{
-				ID: newID(), Description: strings.TrimSpace(*op.Description),
-				Amount: sum, TaxAmount: tax, Source: domain.SourceUser,
-			}
-			first := minInt(idx)
-			var next []domain.LineItem
-			for i, it := range out {
-				if i == first {
-					next = append(next, merged)
-				}
-				if !seen[it.ID] {
-					next = append(next, it)
-				}
-			}
-			out = next
-
-		case "split":
-			i, err := find(op.ItemID)
-			if err != nil {
-				return nil, err
-			}
-			if len(op.Into) < 2 {
-				return nil, fail("INVALID_SPLIT", "split needs at least two parts in into")
-			}
-			parts := make([]domain.LineItem, 0, len(op.Into))
-			for _, p := range op.Into {
-				item, err := newItem(p, newID)
-				if err != nil {
-					return nil, fail("INVALID_ITEM", "%s", err)
-				}
-				parts = append(parts, item)
-			}
-			out = append(out[:i], append(parts, out[i+1:]...)...)
-
-		case "add":
-			item, err := newItem(NewItem{
-				Description: deref(op.Description), Amount: op.Amount,
-				Quantity: op.Quantity, TaxAmount: op.TaxAmount,
-			}, newID)
-			if err != nil {
-				return nil, fail("INVALID_ITEM", "%s", err)
-			}
-			out = append(out, item)
-
-		case "delete":
-			i, err := find(op.ItemID)
-			if err != nil {
-				return nil, err
-			}
-			out = append(out[:i], out[i+1:]...)
-
-		default:
-			return nil, fail("UNKNOWN_OP", "unknown op %q (want update, merge, split, add, delete)", op.Op)
+			return nil, err
 		}
 	}
-	return out, nil
+	return w.items, nil
 }
+
+type (
+	updateCmd Operation
+	mergeCmd  Operation
+	splitCmd  Operation
+	addCmd    Operation
+	deleteCmd Operation
+)
+
+func (c updateCmd) Execute(w *worksheet) error {
+	i, err := w.find(c.ItemID)
+	if err != nil {
+		return err
+	}
+	if c.Description == nil && c.Amount == nil && c.Quantity == nil && c.TaxAmount == nil {
+		return opFail("EMPTY_UPDATE", "update needs at least one of description, amount, quantity, tax_amount")
+	}
+	it := &w.items[i]
+	if c.Description != nil {
+		if !validDesc(c.Description) {
+			return opFail("INVALID_DESCRIPTION", "description must not be empty")
+		}
+		it.Description = strings.TrimSpace(*c.Description)
+	}
+	if c.Amount != nil {
+		it.Amount = *c.Amount
+	}
+	if c.Quantity != nil {
+		it.Quantity = c.Quantity
+	}
+	if c.TaxAmount != nil {
+		it.TaxAmount = c.TaxAmount
+	}
+	it.Source = domain.SourceUser
+	return nil
+}
+
+// Execute replaces the listed items with one item at the position of the first of
+// them. The amount defaults to the sum; tax_amounts are summed when present.
+func (c mergeCmd) Execute(w *worksheet) error {
+	if len(c.ItemIDs) < 2 {
+		return opFail("INVALID_MERGE", "merge needs at least two item_ids")
+	}
+	if !validDesc(c.Description) {
+		return opFail("INVALID_DESCRIPTION", "merge needs a description")
+	}
+	seen := map[string]bool{}
+	first := len(w.items)
+	var sum domain.Money
+	var tax *domain.Money
+	for _, id := range c.ItemIDs {
+		if seen[id] {
+			return opFail("DUPLICATE_ITEM", "item %q listed twice", id)
+		}
+		seen[id] = true
+		i, err := w.find(id)
+		if err != nil {
+			return err
+		}
+		first = min(first, i)
+		sum += w.items[i].Amount
+		if t := w.items[i].TaxAmount; t != nil {
+			total := *t
+			if tax != nil {
+				total += *tax
+			}
+			tax = &total
+		}
+	}
+	if c.Amount != nil {
+		sum = *c.Amount
+	}
+	merged := domain.LineItem{
+		ID: w.newID(), Description: strings.TrimSpace(*c.Description),
+		Amount: sum, TaxAmount: tax, Source: domain.SourceUser,
+	}
+	next := make([]domain.LineItem, 0, len(w.items)-len(c.ItemIDs)+1)
+	for i, it := range w.items {
+		if i == first {
+			next = append(next, merged)
+		}
+		if !seen[it.ID] {
+			next = append(next, it)
+		}
+	}
+	w.items = next
+	return nil
+}
+
+func (c splitCmd) Execute(w *worksheet) error {
+	i, err := w.find(c.ItemID)
+	if err != nil {
+		return err
+	}
+	if len(c.Into) < 2 {
+		return opFail("INVALID_SPLIT", "split needs at least two parts in into")
+	}
+	parts := make([]domain.LineItem, 0, len(c.Into))
+	for _, p := range c.Into {
+		item, err := newItem(p, w.newID)
+		if err != nil {
+			return opFail("INVALID_ITEM", "%s", err)
+		}
+		parts = append(parts, item)
+	}
+	w.items = append(w.items[:i], append(parts, w.items[i+1:]...)...)
+	return nil
+}
+
+func (c addCmd) Execute(w *worksheet) error {
+	item, err := newItem(NewItem{
+		Description: deref(c.Description), Amount: c.Amount,
+		Quantity: c.Quantity, TaxAmount: c.TaxAmount,
+	}, w.newID)
+	if err != nil {
+		return opFail("INVALID_ITEM", "%s", err)
+	}
+	w.items = append(w.items, item)
+	return nil
+}
+
+func (c deleteCmd) Execute(w *worksheet) error {
+	i, err := w.find(c.ItemID)
+	if err != nil {
+		return err
+	}
+	w.items = append(w.items[:i], w.items[i+1:]...)
+	return nil
+}
+
+// opFail builds an *OpError; Apply fills in the index of the failing operation.
+func opFail(code, format string, args ...any) error {
+	return &OpError{Code: code, Message: fmt.Sprintf(format, args...)}
+}
+
+func validDesc(d *string) bool { return d != nil && strings.TrimSpace(*d) != "" }
 
 func newItem(p NewItem, newID func() string) (domain.LineItem, error) {
 	if strings.TrimSpace(p.Description) == "" {
@@ -199,14 +260,4 @@ func deref(s *string) string {
 		return ""
 	}
 	return *s
-}
-
-func minInt(xs []int) int {
-	m := xs[0]
-	for _, x := range xs[1:] {
-		if x < m {
-			m = x
-		}
-	}
-	return m
 }
