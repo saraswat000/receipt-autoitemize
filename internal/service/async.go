@@ -6,7 +6,7 @@ import (
 	"fmt"
 
 	"receipt-autoitemize/internal/ocr"
-	"receipt-autoitemize/internal/store"
+	"receipt-autoitemize/internal/repository"
 	"receipt-autoitemize/internal/worker"
 )
 
@@ -31,13 +31,13 @@ func (s *Service) ProcessAsync(ctx context.Context, receiptID string) (ReceiptVi
 	if s.queue == nil {
 		return ReceiptView{}, errors.New("async processing is not enabled")
 	}
-	prev, claimed, err := s.store.MarkProcessing(ctx, receiptID)
+	prev, claimed, err := s.repo.MarkProcessing(ctx, receiptID)
 	if err != nil {
 		return ReceiptView{}, mapStoreErr(err)
 	}
 	if claimed && !s.queue.TrySubmit(receiptID) {
 		// Put the receipt back so the client can retry later; nothing is lost.
-		if err := s.store.RestoreStatus(ctx, receiptID, prev); err != nil {
+		if err := s.repo.RestoreStatus(ctx, receiptID, prev); err != nil {
 			return ReceiptView{}, err
 		}
 		return ReceiptView{}, ErrQueueFull
@@ -51,7 +51,7 @@ func (s *Service) RecoverPending(ctx context.Context) (int, error) {
 	if s.queue == nil {
 		return 0, nil
 	}
-	ids, err := s.store.PendingReceipts(ctx)
+	ids, err := s.repo.PendingReceipts(ctx)
 	if err != nil {
 		return 0, err
 	}
@@ -72,7 +72,7 @@ func (s *Service) WorkerHandler() worker.Handler {
 		},
 		Retryable: Retryable,
 		Fail: func(ctx context.Context, id string, err error) {
-			_ = s.store.MarkReceiptFailed(ctx, id, err.Error(), s.now())
+			_ = s.repo.MarkReceiptFailed(ctx, id, err.Error(), s.now())
 		},
 	}
 }
@@ -83,7 +83,7 @@ func Retryable(err error) bool {
 	switch {
 	case errors.Is(err, ocr.ErrNoText), // the engine read the file and found nothing
 		errors.Is(err, ErrNotFound),
-		errors.Is(err, store.ErrNotFound):
+		errors.Is(err, repository.ErrNotFound):
 		return false
 	}
 	return true

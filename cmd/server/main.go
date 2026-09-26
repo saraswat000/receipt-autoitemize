@@ -7,6 +7,7 @@
 //	FIXTURES_DIR    stub OCR fixture texts     (default "./fixtures/task-a")
 //	MAX_UPLOAD_MB   upload size limit          (default 10)
 //	LOG_FORMAT      "json" or "text"           (default "text")
+//	STORE           "sqlite" or "memory"       (default "sqlite")
 //	PROCESS_MODE    "sync" or "async"          (default "sync")
 //	OCR_WORKERS     async: concurrent OCR jobs (default 4)
 //	OCR_QUEUE_SIZE  async: jobs that may wait  (default 100)
@@ -29,8 +30,10 @@ import (
 
 	"receipt-autoitemize/internal/api"
 	"receipt-autoitemize/internal/ocr"
+	"receipt-autoitemize/internal/repository"
+	"receipt-autoitemize/internal/repository/memory"
+	"receipt-autoitemize/internal/repository/sqlite"
 	"receipt-autoitemize/internal/service"
-	"receipt-autoitemize/internal/store"
 	"receipt-autoitemize/internal/worker"
 )
 
@@ -64,13 +67,13 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	st, err := store.Open(ctx, filepath.Join(dataDir, "receipts.db"))
+	repo, err := openRepository(ctx, env("STORE", "sqlite"), dataDir)
 	if err != nil {
 		return err
 	}
-	defer st.Close()
+	defer repo.Close()
 
-	svc := service.New(st, ocr.StubEngine{FixturesDir: fixturesDir}, uploadsDir)
+	svc := service.New(repo, ocr.StubEngine{FixturesDir: fixturesDir}, uploadsDir)
 
 	var pool *worker.Pool
 	switch mode := env("PROCESS_MODE", "sync"); mode {
@@ -131,6 +134,19 @@ func run() error {
 		return err
 	}
 	return nil
+}
+
+// openRepository is the only place that knows which database backs the service.
+// Adding Postgres means one more case here plus a package that passes repotest.
+func openRepository(ctx context.Context, kind, dataDir string) (repository.Repository, error) {
+	switch kind {
+	case "sqlite":
+		return sqlite.Open(ctx, filepath.Join(dataDir, "receipts.db"))
+	case "memory":
+		return memory.New(), nil
+	default:
+		return nil, fmt.Errorf("STORE must be sqlite or memory, got %q", kind)
+	}
 }
 
 func workerConfig() (worker.Config, error) {

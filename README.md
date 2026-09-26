@@ -23,6 +23,7 @@ make demo         # with the server running: walks every endpoint on the 3 fixtu
 | Env var | Default | Meaning |
 |---|---|---|
 | `ADDR` | `:8080` | listen address |
+| `STORE` | `sqlite` | repository backend: `sqlite` or `memory` (see "Repository layer") |
 | `DATA_DIR` | `./data` | SQLite DB and stored uploads |
 | `FIXTURES_DIR` | `./fixtures/task-a` | text used by the stub OCR |
 | `MAX_UPLOAD_MB` | `10` | upload size limit |
@@ -174,6 +175,17 @@ A tax-only receipt can be resolved by the user, for example:
 
 These results are asserted against `gold.json` in `internal/extract/extract_test.go` (parser level) and `internal/api/api_test.go` (over HTTP).
 
+## Repository layer
+
+The service depends only on `repository.Repository`, an interface grouping `Receipts`, `OCRResults` and `Transactions`. It never imports a database package. Two implementations ship:
+
+- `repository/sqlite`, the default, with foreign keys, a UNIQUE constraint, CHECK constraints and a SQL transaction per write.
+- `repository/memory`, a mutex-guarded in-memory store (`make run-memory`). It proves the boundary is real, and it's handy for tests.
+
+`repository/repotest` is the **contract suite**: 12 tests covering round trips, one transaction per receipt, in-place re-process, optimistic locking, atomic claim, crash-recovery ordering, isolation of returned values and concurrent writers. Both implementations run it, and `make test` also runs the whole HTTP suite against each backend. To add Postgres or DynamoDB, write a package that passes `repotest.Run` and add a case to `openRepository` in `cmd/server`. Nothing else changes.
+
+Transaction is treated as an aggregate: its header, taxes and items are always read and written together (`SaveProcessed`, `ReplaceItems`), so a backend can't leave half a transaction behind.
+
 ## Async processing
 
 With the stub, OCR is instant, so sync is the default and the brief's curls return the transaction directly. A real OCR or vision-model call takes seconds and sometimes fails, so `PROCESS_MODE=async` moves it off the request path:
@@ -205,7 +217,10 @@ internal/ocr        Engine interface + StubEngine
 internal/extract    OCR text -> header, taxes, proposed items (pure)
 internal/itemize    Reconcile rules + PATCH operations (pure)
 internal/service    use cases: upload, process, re-itemize, patch
-internal/store      SQLite (schema.sql embedded), transactional writes
+internal/repository persistence contract (interfaces + errors) the service depends on
+  ├─ sqlite         SQLite implementation (schema.sql embedded), transactional writes
+  ├─ memory         in-memory implementation
+  └─ repotest       contract test suite every implementation must pass
 internal/worker     bounded goroutine pool: retries, timeouts, graceful shutdown
 internal/api        HTTP handlers, error mapping, middleware
 fixtures/task-a     brief fixtures + gold.json

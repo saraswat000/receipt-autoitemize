@@ -18,8 +18,10 @@ import (
 
 	"receipt-autoitemize/internal/api"
 	"receipt-autoitemize/internal/ocr"
+	"receipt-autoitemize/internal/repository"
+	"receipt-autoitemize/internal/repository/memory"
+	"receipt-autoitemize/internal/repository/sqlite"
 	"receipt-autoitemize/internal/service"
-	"receipt-autoitemize/internal/store"
 )
 
 const fixtures = "../../fixtures/task-a"
@@ -74,11 +76,7 @@ type env struct {
 func newEnv(t *testing.T) *env {
 	t.Helper()
 	dir := t.TempDir()
-	st, err := store.Open(context.Background(), filepath.Join(dir, "test.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { st.Close() })
+	st := openRepo(t, dir)
 	uploads := filepath.Join(dir, "uploads")
 	if err := os.MkdirAll(uploads, 0o755); err != nil {
 		t.Fatal(err)
@@ -88,6 +86,25 @@ func newEnv(t *testing.T) *env {
 	srv := httptest.NewServer(api.New(svc, log, 64<<10).Handler())
 	t.Cleanup(srv.Close)
 	return &env{t: t, srv: srv}
+}
+
+// openRepo builds the backend under test. The whole HTTP suite runs against SQLite by
+// default and against the in-memory repository with TEST_STORE=memory (see Makefile),
+// which shows the service does not depend on any particular database.
+func openRepo(t *testing.T, dir string) repository.Repository {
+	t.Helper()
+	var repo repository.Repository
+	if os.Getenv("TEST_STORE") == "memory" {
+		repo = memory.New()
+	} else {
+		st, err := sqlite.Open(context.Background(), filepath.Join(dir, "test.db"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		repo = st
+	}
+	t.Cleanup(func() { repo.Close() })
+	return repo
 }
 
 func (e *env) do(method, path string, body io.Reader, headers map[string]string) (*http.Response, []byte) {

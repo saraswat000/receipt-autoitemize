@@ -18,7 +18,7 @@ import (
 	"receipt-autoitemize/internal/extract"
 	"receipt-autoitemize/internal/itemize"
 	"receipt-autoitemize/internal/ocr"
-	"receipt-autoitemize/internal/store"
+	"receipt-autoitemize/internal/repository"
 )
 
 // Errors the transport layer maps to status codes.
@@ -39,19 +39,20 @@ type ReconcileError struct {
 func (e *ReconcileError) Error() string { return "line items do not reconcile with the transaction" }
 
 type Service struct {
-	store      *store.Store
+	repo       repository.Repository
 	ocr        ocr.Engine
 	uploadsDir string
 	now        func() time.Time
 	queue      Queue // nil = synchronous processing
 }
 
-func New(st *store.Store, engine ocr.Engine, uploadsDir string) *Service {
-	return &Service{store: st, ocr: engine, uploadsDir: uploadsDir, now: func() time.Time { return time.Now().UTC() }}
+// New builds the service on any repository implementation (sqlite, memory, ...).
+func New(repo repository.Repository, engine ocr.Engine, uploadsDir string) *Service {
+	return &Service{repo: repo, ocr: engine, uploadsDir: uploadsDir, now: func() time.Time { return time.Now().UTC() }}
 }
 
 func (s *Service) OCREngineName() string          { return s.ocr.Name() }
-func (s *Service) Ping(ctx context.Context) error { return s.store.Ping(ctx) }
+func (s *Service) Ping(ctx context.Context) error { return s.repo.Ping(ctx) }
 
 // NewID returns a prefixed random ID such as "txn_3f9c0a1b2c3d4e5f".
 func NewID(prefix string) string {
@@ -93,13 +94,13 @@ func (s *Service) Upload(ctx context.Context, filename, contentType string, data
 	if err := os.WriteFile(r.StoragePath, data, 0o600); err != nil {
 		return UploadResult{}, fmt.Errorf("store file: %w", err)
 	}
-	if err := s.store.CreateReceipt(ctx, r); err != nil {
+	if err := s.repo.CreateReceipt(ctx, r); err != nil {
 		_ = os.Remove(r.StoragePath)
 		return UploadResult{}, err
 	}
 	res := UploadResult{Receipt: r}
 	// Same bytes uploaded before is a likely duplicate expense; flag it, don't block it.
-	if dup, ok, err := s.store.FindDuplicate(ctx, r.SHA256, r.ID); err != nil {
+	if dup, ok, err := s.repo.FindDuplicate(ctx, r.SHA256, r.ID); err != nil {
 		return UploadResult{}, err
 	} else if ok {
 		res.DuplicateOf = &dup
@@ -126,17 +127,17 @@ type ReceiptView struct {
 }
 
 func (s *Service) GetReceipt(ctx context.Context, id string) (ReceiptView, error) {
-	r, err := s.store.GetReceipt(ctx, id)
+	r, err := s.repo.GetReceipt(ctx, id)
 	if err != nil {
 		return ReceiptView{}, mapStoreErr(err)
 	}
 	v := ReceiptView{Receipt: r}
-	if o, err := s.store.LatestOCR(ctx, id); err == nil {
+	if o, err := s.repo.LatestOCR(ctx, id); err == nil {
 		v.OCREngine, v.OCRText = &o.Engine, &o.Text
-	} else if !errors.Is(err, store.ErrNotFound) {
+	} else if !errors.Is(err, repository.ErrNotFound) {
 		return v, err
 	}
-	if txnID, ok, err := s.store.TransactionIDForReceipt(ctx, id); err != nil {
+	if txnID, ok, err := s.repo.TransactionIDForReceipt(ctx, id); err != nil {
 		return v, err
 	} else if ok {
 		v.TransactionID = &txnID
@@ -152,7 +153,7 @@ func (s *Service) Process(ctx context.Context, receiptID string) (domain.Transac
 	txnID, err := s.processOnce(ctx, receiptID)
 	if err != nil {
 		if errors.Is(err, ErrOCRFailed) {
-			if markErr := s.store.MarkReceiptFailed(ctx, receiptID, err.Error(), s.now()); markErr != nil {
+			if markErr := s.repo.MarkReceiptFailed(ctx, receiptID, err.Error(), s.now()); markErr != nil {
 				return domain.Transaction{}, markErr
 			}
 		}
@@ -165,7 +166,7 @@ func (s *Service) Process(ctx context.Context, receiptID string) (domain.Transac
 // idempotent (the save is an upsert on receipt_id), so the async worker can retry it.
 // It does not record failures; the caller decides whether a failure is final.
 func (s *Service) processOnce(ctx context.Context, receiptID string) (string, error) {
-	r, err := s.store.GetReceipt(ctx, receiptID)
+	r, err := s.repo.GetReceipt(ctx, receiptID)
 	if err != nil {
 		return "", mapStoreErr(err)
 	}
@@ -187,7 +188,7 @@ func (s *Service) processOnce(ctx context.Context, receiptID string) (string, er
 		h.Taxes[i].ID = NewID("tax")
 	}
 
-	return s.store.SaveProcessed(ctx, ocrResult, domain.Transaction{
+	return s.repo.SaveProcessed(ctx, ocrResult, domain.Transaction{
 		ID:            NewID("txn"), // ignored when the receipt already has a transaction
 		ReceiptID:     r.ID,
 		Merchant:      h.Merchant,
@@ -213,7 +214,7 @@ func (e *ocrError) Is(target error) bool { return target == ErrOCRFailed }
 func (e *ocrError) Unwrap() error        { return e.err }
 
 func (s *Service) GetTransaction(ctx context.Context, id string) (domain.Transaction, error) {
-	t, err := s.store.GetTransaction(ctx, id)
+	t, err := s.repo.GetTransaction(ctx, id)
 	return t, mapStoreErr(err)
 }
 
@@ -227,7 +228,7 @@ func (s *Service) Reitemize(ctx context.Context, txnID string, ifMatch *int) (do
 	if err != nil {
 		return t, err
 	}
-	o, err := s.store.OCRByID(ctx, t.OCRResultID)
+	o, err := s.repo.OCRByID(ctx, t.OCRResultID)
 	if err != nil {
 		return t, fmt.Errorf("load stored OCR: %w", err)
 	}
@@ -235,7 +236,7 @@ func (s *Service) Reitemize(ctx context.Context, txnID string, ifMatch *int) (do
 	status, issues := itemize.Reconcile(itemize.Input{
 		Items: items, Taxes: t.Taxes, GrandTotal: t.GrandTotal, Subtotal: t.Subtotal,
 	})
-	if err := s.store.ReplaceItems(ctx, t.ID, t.Version, items, status, issues, s.now()); err != nil {
+	if err := s.repo.ReplaceItems(ctx, t.ID, t.Version, items, status, issues, s.now()); err != nil {
 		return t, mapStoreErr(err)
 	}
 	return s.GetTransaction(ctx, t.ID)
@@ -258,14 +259,14 @@ func (s *Service) PatchItems(ctx context.Context, txnID string, ifMatch *int, op
 	if status != domain.ItemizeComplete {
 		return t, &ReconcileError{Issues: issues, Proposed: proposed}
 	}
-	if err := s.store.ReplaceItems(ctx, t.ID, t.Version, proposed, status, issues, s.now()); err != nil {
+	if err := s.repo.ReplaceItems(ctx, t.ID, t.Version, proposed, status, issues, s.now()); err != nil {
 		return t, mapStoreErr(err)
 	}
 	return s.GetTransaction(ctx, t.ID)
 }
 
 func (s *Service) loadForWrite(ctx context.Context, txnID string, ifMatch *int) (domain.Transaction, error) {
-	t, err := s.store.GetTransaction(ctx, txnID)
+	t, err := s.repo.GetTransaction(ctx, txnID)
 	if err != nil {
 		return t, mapStoreErr(err)
 	}
@@ -284,9 +285,9 @@ func withIDs(items []domain.LineItem) []domain.LineItem {
 
 func mapStoreErr(err error) error {
 	switch {
-	case errors.Is(err, store.ErrNotFound):
+	case errors.Is(err, repository.ErrNotFound):
 		return ErrNotFound
-	case errors.Is(err, store.ErrVersionConflict):
+	case errors.Is(err, repository.ErrVersionConflict):
 		// Someone else wrote between our read and write.
 		return ErrPreconditionFailed
 	}

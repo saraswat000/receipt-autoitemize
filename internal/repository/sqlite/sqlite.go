@@ -1,6 +1,6 @@
-// Package store persists receipts, OCR results and transactions in SQLite.
+// Package sqlite implements repository.Repository on SQLite.
 // Every multi-row write runs in one database transaction.
-package store
+package sqlite
 
 import (
 	"context"
@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"receipt-autoitemize/internal/domain"
+	"receipt-autoitemize/internal/repository"
 
 	_ "modernc.org/sqlite" // pure-Go driver: no cgo, so `go run` and Docker just work
 )
@@ -19,12 +20,16 @@ import (
 //go:embed schema.sql
 var schema string
 
+// Aliases so callers can match errors from either package.
 var (
-	ErrNotFound        = errors.New("not found")
-	ErrVersionConflict = errors.New("version conflict")
+	ErrNotFound        = repository.ErrNotFound
+	ErrVersionConflict = repository.ErrVersionConflict
 )
 
+// Store is the SQLite repository.
 type Store struct{ db *sql.DB }
+
+var _ repository.Repository = (*Store)(nil)
 
 // Open opens (or creates) the database at path and applies the schema.
 func Open(ctx context.Context, path string) (*Store, error) {
@@ -206,6 +211,13 @@ func (s *Store) TransactionIDForReceipt(ctx context.Context, receiptID string) (
 func (s *Store) SaveProcessed(ctx context.Context, ocr domain.OCRResult, t domain.Transaction) (string, error) {
 	var txnID string
 	err := s.inTx(ctx, func(tx *sql.Tx) error {
+		var exists int
+		if err := tx.QueryRowContext(ctx, `SELECT 1 FROM receipts WHERE id = ?`, ocr.ReceiptID).Scan(&exists); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return ErrNotFound
+			}
+			return err
+		}
 		if _, err := tx.ExecContext(ctx,
 			`INSERT INTO ocr_results (id, receipt_id, engine, raw_text, created_at) VALUES (?, ?, ?, ?, ?)`,
 			ocr.ID, ocr.ReceiptID, ocr.Engine, ocr.Text, ts(ocr.CreatedAt)); err != nil {
@@ -326,6 +338,9 @@ func (s *Store) GetTransaction(ctx context.Context, id string) (domain.Transacti
 	t.CreatedAt, t.UpdatedAt = parseTS(created), parseTS(updated)
 	if err := json.Unmarshal([]byte(issues), &t.ItemizeIssues); err != nil {
 		return t, fmt.Errorf("decode itemize_issues: %w", err)
+	}
+	if t.ItemizeIssues == nil {
+		t.ItemizeIssues = []domain.Issue{}
 	}
 
 	if t.Taxes, err = s.taxes(ctx, id); err != nil {

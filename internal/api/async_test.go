@@ -15,8 +15,9 @@ import (
 	"receipt-autoitemize/internal/api"
 	"receipt-autoitemize/internal/domain"
 	"receipt-autoitemize/internal/ocr"
+	"receipt-autoitemize/internal/repository"
+	"receipt-autoitemize/internal/repository/sqlite"
 	"receipt-autoitemize/internal/service"
-	"receipt-autoitemize/internal/store"
 	"receipt-autoitemize/internal/worker"
 )
 
@@ -50,17 +51,13 @@ func (g *gatedEngine) ExtractText(ctx context.Context, in ocr.Input) (string, er
 
 type asyncEnv struct {
 	*env
-	store *store.Store
+	store repository.Repository
 }
 
 func newAsyncEnv(t *testing.T, engine ocr.Engine, workers, queueSize int) *asyncEnv {
 	t.Helper()
 	dir := t.TempDir()
-	st, err := store.Open(context.Background(), filepath.Join(dir, "test.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { st.Close() })
+	st := openRepo(t, dir)
 	uploads := filepath.Join(dir, "uploads")
 	os.MkdirAll(uploads, 0o755)
 
@@ -220,7 +217,7 @@ func TestAsyncUnreadableReceiptEndsOCRFailed(t *testing.T) {
 func TestRecoveryAfterCrash(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
-	st, err := store.Open(ctx, filepath.Join(dir, "test.db"))
+	st, err := sqlite.Open(ctx, filepath.Join(dir, "test.db"))
 	if err != nil {
 		t.Fatal(err)
 	}

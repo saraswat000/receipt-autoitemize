@@ -3,14 +3,14 @@
 ## Layers
 
 ```
-HTTP (internal/api) ──> service (use cases) ──> store (SQLite)
+HTTP (internal/api) ──> service (use cases) ──> repository (interface) ──> sqlite | memory
                           ▲       │
   worker.Pool (async) ────┘       ├──> ocr.Engine        (stub today, vendor later)
   bounded goroutines              ├──> extract           (pure: text -> header, taxes, items)
                                   └──> itemize           (pure: reconcile rules, PATCH operations)
 ```
 
-The domain rules live in `extract` and `itemize`. Both are pure functions with no I/O, clock or IDs, so they are tested directly against `gold.json`. The service layer orchestrates, the store owns atomicity, and the HTTP layer only decodes requests and maps errors.
+The domain rules live in `extract` and `itemize`. Both are pure functions with no I/O, clock or IDs, so they are tested directly against `gold.json`. The service layer orchestrates, and it depends on the `repository.Repository` interface, not a database. Implementations own atomicity and must pass the shared `repotest` contract suite. The HTTP layer only decodes requests and maps errors.
 
 ## Data model
 
@@ -33,8 +33,8 @@ receipts 1 ── 1 transactions         UNIQUE(receipt_id): one transaction per
 | Invariant | Where |
 |---|---|
 | One transaction per receipt, even with concurrent `process` calls | `UNIQUE(receipt_id)` plus `INSERT … ON CONFLICT DO UPDATE` |
-| Process is atomic (OCR row, header, taxes, items) | a single SQL transaction in `store.SaveProcessed` |
-| Re-itemize and PATCH change items only, never header or taxes | `store.ReplaceItems` only touches `line_items` and the itemize status |
+| Process is atomic (OCR row, header, taxes, items) | `Repository.SaveProcessed` (one SQL transaction in sqlite; one critical section in memory) |
+| Re-itemize and PATCH change items only, never header or taxes | `Repository.ReplaceItems` only touches `line_items` and the itemize status |
 | The total is never adjusted and no balancing line is invented | `itemize.Reconcile` only reports; PATCH returns 409 and writes nothing |
 | A crash never loses an accepted async job | `PROCESSING` is written before the hand-off; recovery re-queues on start |
 | Duplicate `/process` calls run OCR once | a conditional claim (`MarkProcessing`) inside one SQL transaction |
@@ -44,7 +44,7 @@ receipts 1 ── 1 transactions         UNIQUE(receipt_id): one transaction per
 ## Tradeoffs made for scope
 
 - **Processing is sync by default and async on request.** `PROCESS_MODE=async` returns `202` and runs OCR on a bounded goroutine pool. It includes per-attempt timeouts, retries with backoff for transient errors, and `503` backpressure when the queue is full. The database is the durable queue: receipts are marked `PROCESSING` before they are handed to the channel, and startup recovery re-queues any left behind. The pool is per process, so with several replicas the channel becomes SQS or Kafka and the workers become their own deployment. The job code stays the same because it is already idempotent.
-- **Local disk and SQLite.** One connection serialises writes. Production would use object storage (S3 with content-addressed keys) and Postgres. The store package is the only code that would change.
+- **Local disk and SQLite.** One connection serialises writes. Production would use object storage (S3 with content-addressed keys) and Postgres. That means a new `repository` implementation that passes `repotest`, plus one line in `cmd/server`. The service and HTTP layers don't change.
 - **A regex parser over labelled text.** It is deliberately simple and deterministic. A real pipeline would put a VLM that returns structured JSON with a confidence score per field behind `ocr.Engine`. Low confidence would map to `NEEDS_REVIEW` just like a total mismatch does today. The reconciliation rules would stay the same and act as the guardrail on model output.
 - **Re-itemize overwrites user edits** because the brief asks for that. Items carry `source`, so a future `?preserve_user_edits=true` would be simple to add.
 
