@@ -15,6 +15,8 @@ import (
 // currencies (EUR, USD, ...); see ARCHITECTURE.md for zero/three-decimal currencies.
 type Money int64
 
+const maxWholeDigits = 15
+
 // ParseMoney parses "3.50", "3,50", "-1.9" or "24" into cents. More than two
 // fractional digits is rejected rather than silently rounded.
 func ParseMoney(s string) (Money, error) {
@@ -39,6 +41,11 @@ func ParseMoney(s string) (Money, error) {
 	}
 	if !isDigits(whole) || !isDigits(frac) {
 		return 0, fmt.Errorf("invalid amount %q", s)
+	}
+	// 15 whole digits keep w*100+f far inside int64; anything larger is a typo or
+	// an attack, and must not silently wrap around.
+	if len(strings.TrimLeft(whole, "0")) > maxWholeDigits {
+		return 0, fmt.Errorf("amount %q is too large", s)
 	}
 	w, err := strconv.ParseInt(whole, 10, 64)
 	if err != nil {
@@ -97,26 +104,3 @@ func (m *Money) UnmarshalJSON(b []byte) error {
 
 // MoneyPtr is a convenience for optional amounts.
 func MoneyPtr(m Money) *Money { return &m }
-
-// Rate is a tax rate in basis points (1/100 of a percent): 19% = 1900.
-// Stored as an integer for the same reason as Money.
-type Rate int64
-
-// ParseRatePercent parses the percentage printed on a receipt ("19", "7.7", "5,5").
-func ParseRatePercent(s string) (Rate, error) {
-	m, err := ParseMoney(s) // same shape: up to two decimals
-	if err != nil {
-		return 0, fmt.Errorf("invalid rate %q", s)
-	}
-	return Rate(m), nil
-}
-
-// String renders the rate as a fraction: 1900 -> "0.19", 770 -> "0.077".
-func (r Rate) String() string {
-	s := fmt.Sprintf("%d.%04d", int64(r)/10000, int64(r)%10000)
-	s = strings.TrimRight(s, "0")
-	return strings.TrimSuffix(s, ".")
-}
-
-// MarshalJSON emits the rate as a fraction number (0.19), matching gold.json.
-func (r Rate) MarshalJSON() ([]byte, error) { return []byte(r.String()), nil }

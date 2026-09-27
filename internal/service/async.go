@@ -4,16 +4,16 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 
 	"receipt-autoitemize/internal/ocr"
 	"receipt-autoitemize/internal/repository"
-	"receipt-autoitemize/internal/worker"
 )
 
 // ErrQueueFull means the OCR queue has no room; the API answers 503 + Retry-After.
 var ErrQueueFull = errors.New("processing queue is full")
 
-// Queue is the part of worker.Pool the service needs.
+// Queue is the part of a job queue the service needs (worker.Pool in cmd/server).
 type Queue interface {
 	TrySubmit(receiptID string) bool
 	Submit(ctx context.Context, receiptID string) error
@@ -37,7 +37,9 @@ func (s *Service) ProcessAsync(ctx context.Context, receiptID string) (ReceiptVi
 	}
 	if claimed && !s.queue.TrySubmit(receiptID) {
 		// Put the receipt back so the client can retry later; nothing is lost.
-		if err := s.repo.RestoreStatus(ctx, receiptID, prev); err != nil {
+		// Detached from the request: if the client hangs up now, the receipt must
+		// still go back, or it would sit PROCESSING with no job behind it.
+		if err := s.repo.RestoreStatus(context.WithoutCancel(ctx), receiptID, prev); err != nil {
 			return ReceiptView{}, err
 		}
 		return ReceiptView{}, ErrQueueFull
@@ -45,15 +47,23 @@ func (s *Service) ProcessAsync(ctx context.Context, receiptID string) (ReceiptVi
 	return s.GetReceipt(ctx, receiptID)
 }
 
-// RecoverPending re-queues receipts left in PROCESSING by a crash or shutdown.
-// The database is the durable queue; the in-memory channel is only a hand-off.
-func (s *Service) RecoverPending(ctx context.Context) (int, error) {
+// PendingJobs snapshots the receipts left in PROCESSING by a crash or shutdown. The
+// database is the durable queue; the in-memory channel is only a hand-off.
+//
+// Take the snapshot before the server accepts requests. A receipt that a live
+// request claims afterwards is not in it, so no job is ever queued twice (which
+// would be harmless, since saves are idempotent, but pays the vendor twice).
+func (s *Service) PendingJobs(ctx context.Context) ([]string, error) {
+	if s.queue == nil {
+		return nil, nil
+	}
+	return s.repo.PendingReceipts(ctx)
+}
+
+// Requeue hands a PendingJobs snapshot to the queue, waiting for room as needed.
+func (s *Service) Requeue(ctx context.Context, ids []string) (int, error) {
 	if s.queue == nil {
 		return 0, nil
-	}
-	ids, err := s.repo.PendingReceipts(ctx)
-	if err != nil {
-		return 0, err
 	}
 	for i, id := range ids {
 		if err := s.queue.Submit(ctx, id); err != nil {
@@ -63,30 +73,28 @@ func (s *Service) RecoverPending(ctx context.Context) (int, error) {
 	return len(ids), nil
 }
 
-// WorkerHandler adapts the service to the worker pool.
-func (s *Service) WorkerHandler() worker.Handler {
-	return worker.Handler{
-		Run: func(ctx context.Context, id string) error {
-			_, err := s.processOnce(ctx, id)
-			return err
-		},
-		Retryable: Retryable,
-		Fail: func(ctx context.Context, id string, err error) {
-			_ = s.repo.MarkReceiptFailed(ctx, id, err.Error(), s.now())
-		},
-	}
+// RunJob is one async processing attempt. It is idempotent, so a queue may deliver
+// the same job more than once.
+func (s *Service) RunJob(ctx context.Context, receiptID string) error {
+	_, err := s.processOnce(ctx, receiptID)
+	return err
+}
+
+// FailJob records a job that will not be retried. The pool has already logged err.
+func (s *Service) FailJob(ctx context.Context, receiptID string, err error) error {
+	return s.repo.MarkReceiptFailed(ctx, receiptID, FailureReason(err), s.now())
 }
 
 // Retryable separates transient failures (vendor timeout, 5xx, a DB hiccup) from
-// permanent ones that will fail the same way every time.
+// permanent ones that will fail the same way every time. Both the async worker and
+// the synchronous Process use it, so a failure is classified the same way in both.
 func Retryable(err error) bool {
 	switch {
 	case errors.Is(err, ocr.ErrNoText), // the engine read the file and found nothing
+		errors.Is(err, fs.ErrNotExist), // the stored upload is gone
 		errors.Is(err, ErrNotFound),
 		errors.Is(err, repository.ErrNotFound):
 		return false
 	}
 	return true
 }
-
-var _ Queue = (*worker.Pool)(nil)

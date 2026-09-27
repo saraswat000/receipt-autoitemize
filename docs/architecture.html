@@ -1,0 +1,456 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Receipt Auto-Itemize: Architecture</title>
+<style>
+  @page { size: A4; margin: 16mm 16mm 18mm 16mm; }
+  :root {
+    --ink: #1b2330; --muted: #5b6676; --line: #d9dee6; --soft: #f3f5f8;
+    --accent: #1f5fbf; --accent-soft: #e8f0fc; --ok: #1d7a46; --ok-soft: #e6f4ec;
+    --warn: #9a5b00; --warn-soft: #fdf2e0; --bad: #a3262a; --bad-soft: #fbe9ea;
+  }
+  * { box-sizing: border-box; }
+  html { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+  body { font: 10pt/1.45 -apple-system, "Helvetica Neue", Helvetica, Arial, sans-serif; color: var(--ink); margin: 0; }
+  h1 { font-size: 22pt; line-height: 1.15; margin: 0 0 4pt; letter-spacing: -0.3pt; }
+  h2 { font-size: 14pt; margin: 0 0 8pt; padding-bottom: 4pt; border-bottom: 2px solid var(--accent); }
+  h3 { font-size: 10.5pt; margin: 12pt 0 4pt; }
+  p { margin: 0 0 6pt; }
+  code { font: 8.6pt/1.3 "SF Mono", Menlo, Consolas, monospace; background: var(--soft); padding: 0.5pt 3pt; border-radius: 3px; }
+  .page { break-after: page; }
+  .page:last-child { break-after: auto; }
+  .sub { color: var(--muted); font-size: 11pt; margin-bottom: 14pt; }
+  .kicker { text-transform: uppercase; letter-spacing: 1.2pt; font-size: 8pt; color: var(--accent); font-weight: 700; margin-bottom: 6pt; }
+  table { width: 100%; border-collapse: collapse; margin: 4pt 0 10pt; font-size: 8.8pt; }
+  th { text-align: left; background: var(--soft); font-weight: 600; }
+  th, td { border-bottom: 1px solid var(--line); padding: 4pt 6pt; vertical-align: top; }
+  .grid { display: grid; gap: 8pt; }
+  .g2 { grid-template-columns: 1fr 1fr; } .g3 { grid-template-columns: 1fr 1fr 1fr; } .g4 { grid-template-columns: repeat(4, 1fr); }
+  .card { border: 1px solid var(--line); border-radius: 6px; padding: 7pt 9pt; background: #fff; }
+  .card h3 { margin-top: 0; }
+  .stat { font-size: 17pt; font-weight: 700; color: var(--accent); line-height: 1.1; }
+  .stat-l { font-size: 8pt; color: var(--muted); }
+  .pill { display: inline-block; font-size: 7.8pt; font-weight: 600; padding: 1pt 6pt; border-radius: 9px; }
+  .ok { background: var(--ok-soft); color: var(--ok); } .warn { background: var(--warn-soft); color: var(--warn); }
+  .bad { background: var(--bad-soft); color: var(--bad); } .info { background: var(--accent-soft); color: var(--accent); }
+  .note { border-left: 3px solid var(--accent); background: var(--accent-soft); padding: 6pt 9pt; margin: 6pt 0 10pt; font-size: 9pt; }
+  ul { margin: 0 0 6pt; padding-left: 14pt; } li { margin-bottom: 2pt; }
+  .small { font-size: 8.6pt; color: var(--muted); }
+  td code { white-space: nowrap; }
+  svg { display: block; width: 100%; height: auto; margin: 4pt 0 8pt; }
+  svg text { font-family: -apple-system, "Helvetica Neue", Helvetica, Arial, sans-serif; }
+  .foot { position: fixed; bottom: -10mm; left: 0; right: 0; font-size: 7.5pt; color: var(--muted); display: flex; justify-content: space-between; }
+</style>
+</head>
+<body>
+<div class="foot"><span>Receipt Auto-Itemize: Architecture</span><span>Navan take-home, Task A</span></div>
+
+<!-- ============================================================ 1. Overview -->
+<section class="page">
+  <div class="kicker">Navan take-home, Task A</div>
+  <h1>Receipt upload, taxes and auto-itemize</h1>
+  <div class="sub">Architecture and design review document</div>
+
+  <p>A Go HTTP service. A user uploads a receipt, and processing creates <b>exactly one transaction</b> with its <b>tax lines as separate records</b>, <b>auto-itemized line items</b>, the <b>raw OCR text</b>, and an <b>itemize status</b> (<code>COMPLETE</code>, <code>NEEDS_REVIEW</code> or <code>FAILED</code>). Users can edit, merge and split items. An edit that breaks the totals is rejected with <code>409</code> and the mismatch, and the service never invents a balancing line or adjusts a total.</p>
+
+  <div class="note"><b>OCR is stubbed</b>, as the brief allows. No vendor is called and no API key exists. A text upload is its own OCR output, and an image or PDF named after a fixture returns that fixture's text. The engine sits behind an interface, so a real OCR or VLM engine drops in without touching the service.</div>
+
+  <div class="grid g4" style="margin: 10pt 0 12pt">
+    <div class="card"><div class="stat">5 + 2</div><div class="stat-l">required endpoints, plus health and receipt status</div></div>
+    <div class="card"><div class="stat">3 / 3</div><div class="stat-l">fixtures match <code>gold.json</code>, in sync and async mode</div></div>
+    <div class="card"><div class="stat">84–98%</div><div class="stat-l">statement coverage per core package, all under <code>-race</code></div></div>
+    <div class="card"><div class="stat">2</div><div class="stat-l">storage backends passing one 15-case contract suite</div></div>
+  </div>
+
+  <h3>Run it</h3>
+  <table>
+    <tr><th style="width:34%">Command</th><th>What it does</th></tr>
+    <tr><td><code>make run</code> (or <code>go run ./cmd/server</code>)</td><td>API on <code>:8080</code>, SQLite and uploads in <code>./data</code>. Needs Go 1.25+; <code>make docker</code> also works.</td></tr>
+    <tr><td><code>make test</code></td><td>Unit, gold, contract and end-to-end HTTP tests with the race detector; the HTTP suite runs on both backends.</td></tr>
+    <tr><td><code>make demo</code></td><td>With the server running, walks every endpoint over the three fixtures.</td></tr>
+  </table>
+
+  <h3>API</h3>
+  <table>
+    <tr><th style="width:34%">Endpoint</th><th>Behaviour</th></tr>
+    <tr><td><code>POST /receipts</code></td><td>Multipart upload. File type is sniffed from the bytes (JPEG, PNG, WebP, GIF, PDF, text). Returns <code>201</code> and <code>receipt_id</code>, and flags identical bytes as <code>duplicate_of</code>.</td></tr>
+    <tr><td><code>POST /receipts/{id}/process</code></td><td>OCR, extraction and auto-itemize. Creates or updates the one transaction. Sync by default (<code>200</code>); <code>PROCESS_MODE=async</code> answers <code>202</code>.</td></tr>
+    <tr><td><code>GET /transactions/{id}</code></td><td>Header, taxes, line items, <code>itemize_status</code> and issues. The version is exposed as the <code>ETag</code>.</td></tr>
+    <tr><td><code>POST /transactions/{id}/itemize</code></td><td>Re-runs auto-itemize from the stored OCR text. Replaces line items only; same transaction ID.</td></tr>
+    <tr><td><code>PATCH /transactions/{id}/items</code></td><td>Edit, merge, split, add, delete, applied all-or-nothing. <code>409</code> with the numbers if the result does not reconcile; optional <code>If-Match</code> (<code>412</code> when stale).</td></tr>
+    <tr><td><code>GET /receipts/{id}</code>, <code>GET /health</code></td><td>Receipt status (for async polling), OCR text and transaction link; liveness with a database ping.</td></tr>
+  </table>
+
+</section>
+
+<!-- ============================================================ 2. Architecture -->
+<section class="page">
+  <h2>Architecture</h2>
+  <p>Dependencies point inward. The domain rules are pure functions, the service orchestrates use cases through interfaces, and infrastructure plugs in at the edges. <code>cmd/server</code> is the only place that knows which concrete pieces are used.</p>
+
+  <svg viewBox="0 0 720 402" role="img" aria-label="Layer diagram">
+    <defs>
+      <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#5b6676"/></marker>
+      <marker id="arrI" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#fff" stroke="#1f5fbf"/></marker>
+    </defs>
+    <!-- bands -->
+    <rect x="4" y="4" width="712" height="62" rx="8" fill="#f3f5f8"/>
+    <text x="14" y="20" font-size="9.5" font-weight="700" fill="#5b6676">TRANSPORT</text>
+    <rect x="4" y="84" width="712" height="130" rx="8" fill="#e8f0fc"/>
+    <text x="14" y="100" font-size="9.5" font-weight="700" fill="#1f5fbf">APPLICATION + PORTS</text>
+    <rect x="4" y="232" width="712" height="64" rx="8" fill="#f3f5f8"/>
+    <text x="14" y="248" font-size="9.5" font-weight="700" fill="#5b6676">INFRASTRUCTURE</text>
+    <rect x="4" y="314" width="712" height="64" rx="8" fill="#e6f4ec"/>
+    <text x="14" y="330" font-size="9.5" font-weight="700" fill="#1d7a46">DOMAIN (PURE)</text>
+
+    <g text-anchor="middle">
+      <!-- transport -->
+      <rect x="150" y="16" width="250" height="40" rx="6" fill="#fff" stroke="#1b2330"/>
+      <text x="275" y="33" font-size="11" font-weight="700">internal/api</text>
+      <text x="275" y="48" font-size="9" fill="#5b6676">handlers · error mapping · middleware</text>
+      <rect x="430" y="16" width="270" height="40" rx="6" fill="#fff" stroke="#1b2330" stroke-dasharray="4 3"/>
+      <text x="565" y="33" font-size="11" font-weight="700">cmd/server (composition root)</text>
+      <text x="565" y="48" font-size="9" fill="#5b6676">config · wiring · pool adapter · shutdown</text>
+      <!-- service -->
+      <rect x="150" y="112" width="550" height="42" rx="6" fill="#fff" stroke="#1f5fbf" stroke-width="1.5"/>
+      <text x="425" y="130" font-size="11" font-weight="700">internal/service</text>
+      <text x="425" y="146" font-size="9" fill="#5b6676">use cases: upload · process (sync / async) · re-itemize · patch · imports no infrastructure</text>
+      <!-- ports -->
+      <g font-size="9">
+        <rect x="20" y="178" width="112" height="24" rx="12" fill="#fff" stroke="#1f5fbf"/><text x="76" y="194">api.Service</text>
+        <rect x="150" y="178" width="160" height="24" rx="12" fill="#fff" stroke="#1f5fbf"/><text x="230" y="194">repository.Repository</text>
+        <rect x="325" y="178" width="120" height="24" rx="12" fill="#fff" stroke="#1f5fbf"/><text x="385" y="194">ocr.Engine</text>
+        <rect x="460" y="178" width="110" height="24" rx="12" fill="#fff" stroke="#1f5fbf"/><text x="515" y="194">FileStore</text>
+        <rect x="585" y="178" width="115" height="24" rx="12" fill="#fff" stroke="#1f5fbf"/><text x="642" y="194">Queue</text>
+      </g>
+      <!-- infrastructure -->
+      <rect x="150" y="256" width="76" height="32" rx="6" fill="#fff" stroke="#1b2330"/>
+      <text x="188" y="270" font-size="9.5" font-weight="700">sqlite</text><text x="188" y="282" font-size="8" fill="#5b6676">default</text>
+      <rect x="234" y="256" width="76" height="32" rx="6" fill="#fff" stroke="#1b2330"/>
+      <text x="272" y="270" font-size="9.5" font-weight="700">memory</text><text x="272" y="282" font-size="8" fill="#5b6676">STORE=memory</text>
+      <rect x="325" y="256" width="120" height="32" rx="6" fill="#fff" stroke="#1b2330"/>
+      <text x="385" y="270" font-size="9.5" font-weight="700">Chain(StubEngine)</text><text x="385" y="282" font-size="8" fill="#5b6676">log → cache → timeout</text>
+      <rect x="460" y="256" width="110" height="32" rx="6" fill="#fff" stroke="#1b2330"/>
+      <text x="515" y="270" font-size="9.5" font-weight="700">storage.Disk</text><text x="515" y="282" font-size="8" fill="#5b6676">S3 later</text>
+      <rect x="585" y="256" width="115" height="32" rx="6" fill="#fff" stroke="#1b2330"/>
+      <text x="642" y="270" font-size="9.5" font-weight="700">worker.Pool</text><text x="642" y="282" font-size="8" fill="#5b6676">async mode only</text>
+      <!-- domain -->
+      <rect x="150" y="336" width="160" height="34" rx="6" fill="#fff" stroke="#1d7a46"/>
+      <text x="230" y="351" font-size="10.5" font-weight="700">internal/extract</text><text x="230" y="364" font-size="8.5" fill="#5b6676">text → header, taxes, items</text>
+      <rect x="325" y="336" width="175" height="34" rx="6" fill="#fff" stroke="#1d7a46"/>
+      <text x="412" y="351" font-size="10.5" font-weight="700">internal/itemize</text><text x="412" y="364" font-size="8.5" fill="#5b6676">reconcile rules · PATCH commands</text>
+      <rect x="515" y="336" width="185" height="34" rx="6" fill="#fff" stroke="#1d7a46"/>
+      <text x="607" y="351" font-size="10.5" font-weight="700">internal/domain</text><text x="607" y="364" font-size="8.5" fill="#5b6676">Money (cents) · Decimal · entities</text>
+    </g>
+
+    <!-- uses (solid) -->
+    <g stroke="#5b6676" fill="none" stroke-width="1.2">
+      <line x1="200" y1="56" x2="90" y2="176" marker-end="url(#arr)"/>
+      <line x1="565" y1="56" x2="565" y2="110" marker-end="url(#arr)"/>
+      <polyline points="150,133 140,133 140,353 148,353" marker-end="url(#arr)"/>
+    </g>
+    <!-- implements (dashed, hollow head) -->
+    <g stroke="#1f5fbf" fill="none" stroke-width="1.1" stroke-dasharray="3 2">
+      <line x1="160" y1="154" x2="118" y2="176" marker-end="url(#arrI)"/>
+      <line x1="188" y1="256" x2="210" y2="204" marker-end="url(#arrI)"/>
+      <line x1="272" y1="256" x2="250" y2="204" marker-end="url(#arrI)"/>
+      <line x1="385" y1="256" x2="385" y2="204" marker-end="url(#arrI)"/>
+      <line x1="515" y1="256" x2="515" y2="204" marker-end="url(#arrI)"/>
+      <line x1="642" y1="256" x2="642" y2="204" marker-end="url(#arrI)"/>
+    </g>
+    <text x="712" y="398" font-size="8.5" fill="#5b6676" text-anchor="end">solid: uses · dashed: implements an interface declared where it is used</text>
+  </svg>
+
+  <div class="grid g2">
+    <div class="card">
+      <h3>Why this shape</h3>
+      <ul>
+        <li><b>The service imports no infrastructure:</b> no HTTP, SQL, <code>os</code> or worker package. Uploads go through <code>FileStore</code>, OCR engines receive bytes, and the pool is wired in <code>cmd/server</code>.</li>
+        <li><b>Interfaces live where they are used:</b> <code>api.Service</code>, <code>service.FileStore</code> and <code>service.Queue</code>. The one exception is <code>repository</code>: two backends and the contract suite must import it without importing the service.</li>
+        <li><b>Domain rules are pure</b> (no I/O, clock or IDs), so they are tested directly against <code>gold.json</code>.</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h3>Extension points</h3>
+      <ul>
+        <li><b>A real OCR/VLM engine</b> implements <code>ocr.Engine</code> and inherits logging, caching and timeouts from the decorator chain.</li>
+        <li><b>Postgres</b> is a new package that passes <code>repotest.Run</code>, plus one case in <code>openRepository</code>.</li>
+        <li><b>S3</b> is a second <code>FileStore</code>. <b>A new PATCH op</b> is a new command type and one registry entry; <code>Apply</code> does not change.</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<!-- ============================================================ 3. Data model -->
+<section class="page">
+  <h2>Data model</h2>
+  <svg viewBox="0 0 720 300" role="img" aria-label="Entity relationship diagram">
+    <defs><marker id="crow" viewBox="0 0 12 12" refX="11" refY="6" markerWidth="10" markerHeight="10" orient="auto"><path d="M0,6 L11,6 M11,0 L0,6 L11,12" stroke="#1b2330" fill="none"/></marker></defs>
+    <g font-size="9">
+      <!-- receipts -->
+      <rect x="10" y="20" width="200" height="150" rx="6" fill="#fff" stroke="#1b2330"/>
+      <rect x="10" y="20" width="200" height="22" rx="6" fill="#1b2330"/>
+      <text x="20" y="35" fill="#fff" font-weight="700" font-size="10.5">receipts</text>
+      <text x="20" y="58">id  PK</text><text x="20" y="72">filename, content_type, size_bytes</text>
+      <text x="20" y="86">sha256  (duplicate detection)</text><text x="20" y="100">storage_path  (FileStore ref)</text>
+      <text x="20" y="114">status  UPLOADED | PROCESSING |</text><text x="58" y="126">PROCESSED | OCR_FAILED</text>
+      <text x="20" y="140">ocr_error  (client-safe text)</text><text x="20" y="154">created_at, processed_at  (epoch ms)</text>
+
+      <!-- ocr_results -->
+      <rect x="10" y="200" width="200" height="86" rx="6" fill="#fff" stroke="#1b2330"/>
+      <rect x="10" y="200" width="200" height="22" rx="6" fill="#1b2330"/>
+      <text x="20" y="215" fill="#fff" font-weight="700" font-size="10.5">ocr_results  (append-only)</text>
+      <text x="20" y="238">id  PK · receipt_id  FK</text><text x="20" y="252">engine</text>
+      <text x="20" y="266">raw_text  (source of truth)</text><text x="20" y="280">created_at</text>
+
+      <!-- transactions -->
+      <rect x="270" y="20" width="200" height="178" rx="6" fill="#fff" stroke="#1f5fbf" stroke-width="1.5"/>
+      <rect x="270" y="20" width="200" height="22" rx="6" fill="#1f5fbf"/>
+      <text x="280" y="35" fill="#fff" font-weight="700" font-size="10.5">transactions  (aggregate root)</text>
+      <text x="280" y="58">id  PK</text><text x="280" y="72">receipt_id  FK  UNIQUE</text>
+      <text x="280" y="86">ocr_result_id  FK  (built from)</text><text x="280" y="100">merchant, txn_date, currency</text>
+      <text x="280" y="114">subtotal_cents, grand_total_cents</text><text x="280" y="128">itemize_status</text>
+      <text x="280" y="142">itemize_issues  (JSON, explains why)</text><text x="280" y="156">version  (optimistic lock = ETag)</text>
+      <text x="280" y="170">created_at, updated_at  (epoch ms)</text>
+
+      <!-- tax_lines -->
+      <rect x="520" y="20" width="190" height="112" rx="6" fill="#fff" stroke="#1b2330"/>
+      <rect x="520" y="20" width="190" height="22" rx="6" fill="#1d7a46"/>
+      <text x="530" y="35" fill="#fff" font-weight="700" font-size="10.5">tax_lines</text>
+      <text x="530" y="58">transaction_id  FK  CASCADE</text><text x="530" y="72">position, name</text>
+      <text x="530" y="86">rate_value, rate_scale  (19123, 3)</text><text x="530" y="100">amount_cents</text>
+      <text x="530" y="114">inclusive, jurisdiction</text>
+
+      <!-- line_items -->
+      <rect x="520" y="160" width="190" height="126" rx="6" fill="#fff" stroke="#1b2330"/>
+      <rect x="520" y="160" width="190" height="22" rx="6" fill="#1d7a46"/>
+      <text x="530" y="175" fill="#fff" font-weight="700" font-size="10.5">line_items</text>
+      <text x="530" y="198">transaction_id  FK  CASCADE</text><text x="530" y="212">position, description</text>
+      <text x="530" y="226">amount_cents (net)</text><text x="530" y="240">quantity_value, quantity_scale</text><text x="530" y="254">tax_amount_cents</text>
+      <text x="530" y="268">source  AUTO | USER</text>
+    </g>
+    <g stroke="#1b2330" fill="none" stroke-width="1.1">
+      <line x1="110" y1="170" x2="110" y2="198" marker-end="url(#crow)"/>
+      <line x1="210" y1="60" x2="268" y2="60"/><text x="224" y="54" font-size="8.5" fill="#5b6676" stroke="none">1 : 1</text>
+      <line x1="210" y1="240" x2="240" y2="240"/><line x1="240" y1="240" x2="240" y2="88"/><line x1="240" y1="88" x2="268" y2="88"/>
+      <line x1="470" y1="70" x2="518" y2="70" marker-end="url(#crow)"/>
+      <line x1="470" y1="120" x2="495" y2="120"/><line x1="495" y1="120" x2="495" y2="210"/><line x1="495" y1="210" x2="518" y2="210" marker-end="url(#crow)"/>
+    </g>
+  </svg>
+
+  <div class="grid g2">
+    <div class="card"><h3>Taxes are rows, not a header number</h3><p>A receipt can carry several rates (7% food and 19% drinks). <code>inclusive</code> separates "VAT 19%" added on top from "incl. VAT 19%" already inside the prices; without it the taxi fixture could never reconcile.</p></div>
+    <div class="card"><h3>Exact types, enforced</h3><p>Money is <code>INTEGER</code> cents; instants are epoch milliseconds (UTC); rates and quantities are exact decimals stored as a value and a power of ten (19.123% = <code>(19123, 3)</code>). Nothing is <code>REAL</code>, sums are overflow-checked, and tables are <code>STRICT</code>, so SQLite rejects a wrongly typed value.</p></div>
+    <div class="card"><h3>Raw OCR is the source of truth</h3><p>Every OCR run is kept. The transaction points at the run it was built from, so re-itemize is deterministic and re-processing keeps history.</p></div>
+    <div class="card"><h3>Explainable status</h3><p><code>itemize_issues</code> carries the numbers behind <code>NEEDS_REVIEW</code> or <code>FAILED</code> (<code>TOTAL_MISMATCH</code>, <code>SUBTOTAL_MISMATCH</code>, <code>NO_ITEMS</code>, <code>NO_TOTAL</code>), so a review UI can say exactly what is wrong.</p></div>
+  </div>
+
+  <h3>Results on the fixtures</h3>
+  <table>
+    <tr><th>Fixture</th><th>Taxes</th><th>Items</th><th>Status</th></tr>
+    <tr><td><code>receipt-clean</code></td><td>VAT 19%, 2.85, added on top</td><td>Espresso 3.50, Sandwich 8.90, Mineral water 2.60</td><td><span class="pill ok">COMPLETE</span></td></tr>
+    <tr><td><code>receipt-tax-only</code></td><td>VAT 19%, 3.83, <b>inclusive</b></td><td>none ("Trip fare" has no price)</td><td><span class="pill warn">NEEDS_REVIEW</span> NO_ITEMS</td></tr>
+    <tr><td><code>receipt-mismatch</code></td><td>VAT 19%, 1.90, added on top</td><td>Water 4.00, Snacks 6.00</td><td><span class="pill warn">NEEDS_REVIEW</span> TOTAL_MISMATCH (11.90 vs 18.50)</td></tr>
+  </table>
+  <h3>Reconciliation rule</h3>
+  <p><code>sum(items) + sum(non-inclusive taxes) = grand_total</code>, within one cent. Items are net of added tax, which matches <code>gold.json</code>. Tip and rounding lines count toward the total but are left out of the printed-subtotal check. A mismatch is reported, never fixed: the service does not change the total and does not invent a balancing line.</p>
+</section>
+
+<!-- ============================================================ 4. Flows -->
+<section class="page">
+  <h2>Processing flows</h2>
+  <h3>Process: sync (default) and async (<code>PROCESS_MODE=async</code>)</h3>
+  <svg viewBox="0 0 720 318" role="img" aria-label="Processing sequence">
+    <defs><marker id="a2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#1b2330"/></marker></defs>
+    <g font-size="9.5" text-anchor="middle" font-weight="700">
+      <rect x="10" y="6" width="90" height="24" rx="5" fill="#f3f5f8" stroke="#1b2330"/><text x="55" y="22">Client</text>
+      <rect x="150" y="6" width="100" height="24" rx="5" fill="#f3f5f8" stroke="#1b2330"/><text x="200" y="22">API + service</text>
+      <rect x="300" y="6" width="100" height="24" rx="5" fill="#f3f5f8" stroke="#1b2330"/><text x="350" y="22">Worker pool</text>
+      <rect x="450" y="6" width="100" height="24" rx="5" fill="#f3f5f8" stroke="#1b2330"/><text x="500" y="22">OCR engine</text>
+      <rect x="600" y="6" width="110" height="24" rx="5" fill="#f3f5f8" stroke="#1b2330"/><text x="655" y="22">Database</text>
+    </g>
+    <g stroke="#c3cad5" stroke-dasharray="3 3"><line x1="55" y1="30" x2="55" y2="312"/><line x1="200" y1="30" x2="200" y2="312"/><line x1="350" y1="30" x2="350" y2="312"/><line x1="500" y1="30" x2="500" y2="312"/><line x1="655" y1="30" x2="655" y2="312"/></g>
+    <g font-size="8.8" fill="#1b2330">
+      <rect x="4" y="38" width="712" height="122" rx="6" fill="#e6f4ec" opacity="0.55"/>
+      <text x="10" y="50" font-weight="700" fill="#1d7a46">SYNC</text>
+      <line x1="55" y1="62" x2="198" y2="62" stroke="#1b2330" marker-end="url(#a2)"/><text x="126" y="58" text-anchor="middle">POST /process</text>
+      <line x1="200" y1="80" x2="498" y2="80" stroke="#1b2330" marker-end="url(#a2)"/><text x="350" y="76" text-anchor="middle">file bytes (timeout, cache, logging)</text>
+      <line x1="500" y1="96" x2="202" y2="96" stroke="#1b2330" stroke-dasharray="4 2" marker-end="url(#a2)"/><text x="350" y="108" text-anchor="middle">raw text, then extract → reconcile (pure)</text>
+      <line x1="200" y1="130" x2="653" y2="130" stroke="#1b2330" marker-end="url(#a2)"/><text x="428" y="126" text-anchor="middle">SaveProcessed: OCR row, header, taxes, items in ONE transaction (upsert on receipt_id)</text>
+      <line x1="200" y1="150" x2="57" y2="150" stroke="#1b2330" stroke-dasharray="4 2" marker-end="url(#a2)"/><text x="126" y="146" text-anchor="middle">200 transaction</text>
+
+      <rect x="4" y="168" width="712" height="144" rx="6" fill="#e8f0fc" opacity="0.6"/>
+      <text x="10" y="180" font-weight="700" fill="#1f5fbf">ASYNC</text>
+      <line x1="55" y1="190" x2="198" y2="190" stroke="#1b2330" marker-end="url(#a2)"/><text x="126" y="186" text-anchor="middle">POST /process</text>
+      <line x1="200" y1="204" x2="653" y2="204" stroke="#1b2330" marker-end="url(#a2)"/><text x="428" y="200" text-anchor="middle">claim: UPDATE … SET PROCESSING WHERE status &lt;&gt; 'PROCESSING' (durable first)</text>
+      <line x1="200" y1="218" x2="348" y2="218" stroke="#1b2330" marker-end="url(#a2)"/><text x="274" y="214" text-anchor="middle">TrySubmit(id)</text>
+      <line x1="200" y1="232" x2="57" y2="232" stroke="#1b2330" stroke-dasharray="4 2" marker-end="url(#a2)"/><text x="126" y="244" text-anchor="middle">202, or 503 + Retry-After</text>
+      <line x1="350" y1="256" x2="498" y2="256" stroke="#1b2330" marker-end="url(#a2)"/><text x="424" y="252" text-anchor="middle">attempt (timeout, retries, backoff)</text>
+      <line x1="350" y1="276" x2="653" y2="276" stroke="#1b2330" marker-end="url(#a2)"/><text x="502" y="272" text-anchor="middle">SaveProcessed (idempotent)  or  mark OCR_FAILED</text>
+      <line x1="55" y1="298" x2="198" y2="298" stroke="#1b2330" marker-end="url(#a2)"/><text x="126" y="294" text-anchor="middle">GET /receipts/{id} (poll)</text>
+    </g>
+  </svg>
+
+  <div class="grid g2">
+    <div class="card">
+      <h3>Async guarantees</h3>
+      <ul>
+        <li><b>The database is the durable queue</b>; the channel is only a hand-off. A receipt is <code>PROCESSING</code> before it is queued, and on start every <code>PROCESSING</code> receipt is re-queued (snapshotted before the server accepts requests).</li>
+        <li><b>At-least-once, idempotent:</b> the save is an upsert on <code>receipt_id</code>, so a job that runs twice still yields one transaction.</li>
+        <li><b>Bounded:</b> <code>OCR_WORKERS</code> caps vendor concurrency; a full queue answers <code>503</code> and restores the receipt's previous state.</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h3>User edits (PATCH)</h3>
+      <ul>
+        <li>Operations run in order on a copy; the first invalid one aborts with <code>422</code> and nothing is written.</li>
+        <li>The result must reconcile with the stored total and taxes, or the answer is <code>409</code> with the issues and the proposed items.</li>
+        <li>The write is <code>UPDATE … WHERE version = ?</code>: a stale <code>If-Match</code> is <code>412</code>, and a lost race without one is <code>409</code>.</li>
+        <li>Re-itemize and PATCH replace items only; header and taxes never change.</li>
+      </ul>
+    </div>
+  </div>
+  <h3>Code map</h3>
+  <div class="grid g2 small" style="gap:2pt 14pt">
+    <div><code>cmd/server</code> config, wiring, graceful shutdown</div>
+    <div><code>internal/api</code> handlers, error mapping, middleware</div>
+    <div><code>internal/service</code> use cases, interfaces only</div>
+    <div><code>internal/extract</code> OCR text → header, taxes, items</div>
+    <div><code>internal/itemize</code> reconcile rules, PATCH commands</div>
+    <div><code>internal/domain</code> Money, Rate, entities</div>
+    <div><code>internal/repository</code> contract, <code>sqlite</code>, <code>memory</code>, <code>repotest</code></div>
+    <div><code>internal/ocr</code> engine, stub, decorators</div>
+    <div><code>internal/storage</code> FileStore on local disk</div>
+    <div><code>internal/worker</code> bounded pool, retries, shutdown</div>
+    <div><code>internal/id</code>, <code>internal/reqid</code> IDs; request ID in logs</div>
+    <div><code>fixtures/task-a</code> brief fixtures and <code>gold.json</code></div>
+  </div>
+</section>
+
+<!-- ============================================================ 5. Invariants & failures -->
+<section class="page">
+  <h2>Invariants and failure handling</h2>
+  <table>
+    <tr><th style="width:42%">Invariant</th><th>Enforced by</th></tr>
+    <tr><td>One transaction per receipt, even under concurrent processing</td><td><code>UNIQUE(receipt_id)</code> and <code>INSERT … ON CONFLICT DO UPDATE</code></td></tr>
+    <tr><td>Processing is atomic (OCR row, header, taxes, items)</td><td><code>Repository.SaveProcessed</code>: one SQL transaction (SQLite) or one critical section (memory)</td></tr>
+    <tr><td>A transaction is read whole (its ETag matches its items)</td><td>Header, taxes and items are read inside one SQL transaction</td></tr>
+    <tr><td>Totals are never adjusted; no balancing line is invented</td><td><code>itemize.Reconcile</code> only reports; PATCH answers <code>409</code> and writes nothing</td></tr>
+    <tr><td>Duplicate async <code>/process</code> calls run OCR once</td><td>Conditional <code>UPDATE … WHERE status &lt;&gt; 'PROCESSING'</code>: exactly one caller sees a row change, on any database</td></tr>
+    <tr><td>No lost updates</td><td><code>version</code> column, <code>ETag</code> / <code>If-Match</code></td></tr>
+    <tr><td>Schema changes reach existing databases</td><td>Ordered, embedded migrations tracked in <code>PRAGMA user_version</code>; a newer database is refused</td></tr>
+    <tr><td>File type is trusted from the bytes; stored names never come from client input</td><td><code>http.DetectContentType</code>, an allow-list, and names built from the receipt ID</td></tr>
+  </table>
+
+  <h3>What happens when things fail</h3>
+  <table>
+    <tr><th style="width:30%">Failure</th><th>Behaviour</th></tr>
+    <tr><td>File has no readable text</td><td>Permanent: receipt marked <code>OCR_FAILED</code> with a client-safe reason; <code>422</code> in sync mode. Never retried.</td></tr>
+    <tr><td>OCR times out or vendor errors</td><td>Transient. Sync: <code>504 OCR_TIMEOUT</code> or <code>503 OCR_UNAVAILABLE</code>, receipt unchanged so the client can retry. Async: retried with capped exponential backoff. Both modes share one <code>Retryable</code> rule.</td></tr>
+    <tr><td>Client disconnects mid-request</td><td>Failure records and status restores run with <code>context.WithoutCancel</code>, so they still happen.</td></tr>
+    <tr><td>A job panics</td><td>Recovered in the worker and recorded as a permanent failure with its stack, so a poison receipt cannot crash-loop the process.</td></tr>
+    <tr><td>Process crashes or shuts down mid-job</td><td>Graceful shutdown stops HTTP, then drains workers within a deadline (backoff sleeps are abandoned). Unfinished receipts stay <code>PROCESSING</code> and are re-queued on start.</td></tr>
+    <tr><td>Handler panics</td><td>Middleware answers <code>500</code> in the standard error shape (unless the response has started) and the request is still access-logged; <code>http.ErrAbortHandler</code> propagates.</td></tr>
+    <tr><td>Internal error details</td><td>Never sent to clients: <code>ocr_error</code> and error bodies carry client-safe messages; the full error is logged with the request ID.</td></tr>
+  </table>
+  <p class="small">Every log line of a request carries its <code>request_id</code> (a context-aware <code>slog</code> handler), including OCR decorator logs. Callers may send <code>X-Request-ID</code>; it is validated and echoed back.</p>
+</section>
+
+<!-- ============================================================ 6. Patterns & quality -->
+<section class="page">
+  <h2>Design patterns and SOLID</h2>
+  <table>
+    <tr><th style="width:18%">Pattern</th><th style="width:30%">Where</th><th>Why it is here</th></tr>
+    <tr><td>Repository</td><td><code>internal/repository</code></td><td>The service never sees a database; backends are swappable and prove it by passing one contract suite.</td></tr>
+    <tr><td>Strategy</td><td><code>ocr.Engine</code>, <code>Repository</code>, <code>FileStore</code>, chosen in <code>cmd/server</code></td><td>Stub OCR today, a vendor or VLM tomorrow; SQLite or memory; local disk or S3.</td></tr>
+    <tr><td>Decorator</td><td><code>ocr.Chain</code>: logging, LRU cache by file hash, timeout</td><td>Cross-cutting concerns around the vendor call without touching the engine or the service.</td></tr>
+    <tr><td>Command</td><td>PATCH ops (<code>internal/itemize/ops.go</code>)</td><td>Each op is a type with <code>Execute</code> and its own accepted fields; a registry maps wire names, so a new op never grows <code>Apply</code>.</td></tr>
+    <tr><td>Adapter</td><td><code>jobHandler</code> in <code>cmd/server</code></td><td>Plugs the service's job methods into the generic pool; neither package imports the other.</td></tr>
+    <tr><td>Worker pool</td><td><code>internal/worker</code></td><td>Bounded concurrency, backpressure, retries, graceful shutdown.</td></tr>
+    <tr><td>Chain of responsibility</td><td>HTTP middleware</td><td>Request ID → access log → panic recovery around every route.</td></tr>
+    <tr><td>Value object</td><td><code>domain.Money</code>, <code>domain.Rate</code></td><td>Exact integer arithmetic; parsing and JSON in one place.</td></tr>
+    <tr><td>Optimistic locking</td><td><code>version</code>, <code>ETag</code>/<code>If-Match</code></td><td>No lost updates without holding locks.</td></tr>
+  </table>
+  <p class="small"><b>Considered and left out:</b> a state machine for receipt status (almost every transition is legal, since any receipt can be re-processed) and Specification objects for reconciliation (three short rules read better as one function).</p>
+
+  <div class="grid g3" style="margin-top: 6pt">
+    <div class="card"><h3>S · O</h3><p>Pure rules, orchestration, transport and storage are separate packages. New OCR engines, backends, file stores and PATCH ops are added, not edited in.</p></div>
+    <div class="card"><h3>L · I</h3><p>Both repositories are behaviourally identical (same contract suite). Small role interfaces: <code>Receipts</code>, <code>OCRResults</code>, <code>Transactions</code>, <code>FileStore</code>, <code>Queue</code>.</p></div>
+    <div class="card"><h3>D</h3><p>High-level policy depends on abstractions declared by the consumer; the composition root is the only place that names concrete types.</p></div>
+  </div>
+
+</section>
+
+<!-- ============================================================ 6b. Testing -->
+<section class="page">
+  <h2>Testing and verification</h2>
+  <table>
+    <tr><th style="width:26%">Layer</th><th>What is tested</th></tr>
+    <tr><td>Domain (pure)</td><td>Extraction and reconciliation against <code>gold.json</code>; PATCH commands; Money parsing, including a fuzz test for parse/print round-trips and overflow.</td></tr>
+    <tr><td>Contract suite</td><td>15 cases every backend must pass: round trips, one transaction per receipt, optimistic locking, atomic claims under concurrency, torn-read and sub-second ordering checks, ID collisions, isolation of returned values.</td></tr>
+    <tr><td>Service</td><td>Unit tests with fakes (file store, engine, queue, failure-injecting repository): upload cleanup, permanent vs transient OCR failures, queue-full restore, 409/412 semantics, safe failure messages.</td></tr>
+    <tr><td>Worker</td><td>Retries, backoff, timeouts, backpressure, shutdown drain and deadline, panics.</td></tr>
+    <tr><td>HTTP end to end</td><td>Every endpoint over real HTTP, gold results in sync and async mode, crash recovery, validation, error shape; the suite runs on both backends.</td></tr>
+  </table>
+  <p class="small">All tests run with the race detector. Beyond the test suite, the code was checked with <code>staticcheck</code>, <code>govulncheck</code> (no known vulnerabilities) and <code>golangci-lint</code>, and adversarially: bugs were only accepted when proven by a failing test, and each such test is kept as a regression test.</p>
+
+  <div class="grid g2">
+    <div class="card">
+      <h3>Statement coverage (<code>go test -cover</code>)</h3>
+      <table style="margin:0">
+        <tr><td>extract</td><td>98%</td><td>repository/memory</td><td>97%</td></tr>
+        <tr><td>worker</td><td>93%</td><td>domain</td><td>90%</td></tr>
+        <tr><td>itemize</td><td>90%</td><td>ocr</td><td>90%</td></tr>
+        <tr><td>api</td><td>89%</td><td>repository/sqlite</td><td>84%</td></tr>
+        <tr><td>service</td><td>84%</td><td>reqid</td><td>88%</td></tr>
+      </table>
+    </div>
+    <div class="card">
+      <h3>Static analysis</h3>
+      <ul>
+        <li><code>go vet</code> and <code>gofmt</code>: clean (enforced by <code>make lint</code>).</li>
+        <li><code>staticcheck</code>: no findings.</li>
+        <li><code>govulncheck</code>: no known vulnerabilities.</li>
+        <li><code>golangci-lint</code> (17 linters incl. gosec, errcheck, errorlint): one real finding (upload directory permissions), fixed.</li>
+      </ul>
+    </div>
+  </div>
+
+  <h3>Adversarial testing</h3>
+  <p>Four independent reviewers attacked concurrency, HTTP input, persistence and the domain rules. A bug only counted with a test that failed on the code. Examples of what was found and fixed:</p>
+  <table>
+    <tr><th style="width:24%">Area</th><th>Bug, now covered by a regression test</th></tr>
+    <tr><td>Reconciliation</td><td>~185 maximum-size items made the int64 sum wrap onto the receipt total and save as <code>COMPLETE</code>; sums are now overflow-checked.</td></tr>
+    <tr><td>Extraction</td><td>"Total VAT" lines were read as the grand total; "19% VAT" (rate first) and German payment lines were booked as items; tips could never reconcile; a UTF-8 BOM hid the merchant.</td></tr>
+    <tr><td>Concurrency</td><td>A claim lease without a fencing token let a stale job run OCR again and overwrite a user's edits; the lease was removed (see tradeoffs).</td></tr>
+    <tr><td>Persistence</td><td>A torn read could pair version N with version N+1's items; the memory backend accepted a transaction-ID collision that SQLite refuses.</td></tr>
+    <tr><td>HTTP</td><td>A 300-byte file extension caused a 500; unmatched routes answered plain text instead of the JSON error shape.</td></tr>
+  </table>
+</section>
+
+<!-- ============================================================ 7. Tradeoffs -->
+<section class="page">
+  <h2>Tradeoffs and the production path</h2>
+  <table>
+    <tr><th style="width:24%">Choice for this scope</th><th style="width:38%">Why</th><th>Production step</th></tr>
+    <tr><td>Stubbed OCR, regex parser over labelled text</td><td>The brief scores against fixtures; deterministic and testable.</td><td>A VLM behind <code>ocr.Engine</code> returning structured JSON with per-field confidence; low confidence maps to <code>NEEDS_REVIEW</code>, and the reconcile rules stay as the guardrail on model output.</td></tr>
+    <tr><td>SQLite, one connection</td><td>Zero setup; one writer avoids <code>SQLITE_BUSY</code>. It also serialises reads, which is this backend's ceiling.</td><td>Postgres as another <code>repository</code> package that passes <code>repotest</code>.</td></tr>
+    <tr><td>Local disk uploads</td><td>The brief allows it.</td><td>S3 with content-addressed keys as a second <code>FileStore</code>.</td></tr>
+    <tr><td>In-process worker pool</td><td>Real async semantics without extra infrastructure.</td><td>SQS or Kafka with separate workers; the job code is already idempotent and at-least-once.</td></tr>
+    <tr><td>Claims without a lease</td><td>A lease without a fencing token let a stale job overwrite newer results (found and proven in adversarial testing, then removed).</td><td>Lease plus a claim token carried with each job and checked on save.</td></tr>
+    <tr><td>Re-itemize and re-process replace user edits</td><td>The brief asks re-itemize to replace items; items carry <code>source</code> and clients may send <code>If-Match</code>.</td><td><code>?preserve_user_edits=true</code>; require <code>If-Match</code> on re-process once <code>USER</code> items exist.</td></tr>
+    <tr><td>No auth</td><td>Explicitly out of scope in the brief.</td><td>Auth and tenancy (<code>user_id</code> on every row), audit log of item edits.</td></tr>
+  </table>
+
+  <h3>Also next</h3>
+  <ul>
+    <li>Allocate tax per line with largest-remainder rounding so line taxes sum exactly to the tax rows; support a rate per line.</li>
+    <li>ISO 4217 currency exponents for zero- and three-decimal currencies (JPY, KWD); jurisdiction from the merchant's country.</li>
+    <li>Duplicate detection beyond identical bytes (same merchant, date and total).</li>
+    <li>Metrics (latency, error rate, <code>NEEDS_REVIEW</code> rate per OCR engine) and tracing on the request ID that is already propagated.</li>
+  </ul>
+
+</section>
+</body>
+</html>

@@ -1,7 +1,11 @@
 package itemize
 
 import (
+	"bytes"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"slices"
 	"strings"
 
 	"receipt-autoitemize/internal/domain"
@@ -16,22 +20,48 @@ import (
 //	{"op":"add","description":"Tip","amount":1.00}
 //	{"op":"delete","item_id":"li_3"}
 type Operation struct {
-	Op          string        `json:"op"`
-	ItemID      string        `json:"item_id,omitempty"`
-	ItemIDs     []string      `json:"item_ids,omitempty"`
-	Description *string       `json:"description,omitempty"`
-	Amount      *domain.Money `json:"amount,omitempty"`
-	Quantity    *float64      `json:"quantity,omitempty"`
-	TaxAmount   *domain.Money `json:"tax_amount,omitempty"`
-	Into        []NewItem     `json:"into,omitempty"`
+	Op          string          `json:"op"`
+	ItemID      string          `json:"item_id,omitempty"`
+	ItemIDs     []string        `json:"item_ids,omitempty"`
+	Description *string         `json:"description,omitempty"`
+	Amount      *domain.Money   `json:"amount,omitempty"`
+	Quantity    *domain.Decimal `json:"quantity,omitempty"`
+	TaxAmount   *domain.Money   `json:"tax_amount,omitempty"`
+	Into        []NewItem       `json:"into,omitempty"`
+
+	// present holds the JSON keys the client actually sent, so a field sent empty
+	// ("item_id": "") or null still counts as sent. Nil for ops built in code.
+	present map[string]bool
+}
+
+// UnmarshalJSON decodes strictly (unknown keys are an error, as for the rest of the
+// request) and records which keys were present.
+func (o *Operation) UnmarshalJSON(b []byte) error {
+	type plain Operation // no methods: avoids recursing into this function
+	dec := json.NewDecoder(bytes.NewReader(b))
+	dec.DisallowUnknownFields()
+	var p plain
+	if err := dec.Decode(&p); err != nil {
+		return err
+	}
+	var keys map[string]json.RawMessage
+	if err := json.Unmarshal(b, &keys); err != nil {
+		return err
+	}
+	*o = Operation(p)
+	o.present = make(map[string]bool, len(keys))
+	for k := range keys {
+		o.present[k] = true
+	}
+	return nil
 }
 
 // NewItem is an item created by split or add.
 type NewItem struct {
-	Description string        `json:"description"`
-	Amount      *domain.Money `json:"amount"`
-	Quantity    *float64      `json:"quantity,omitempty"`
-	TaxAmount   *domain.Money `json:"tax_amount,omitempty"`
+	Description string          `json:"description"`
+	Amount      *domain.Money   `json:"amount"`
+	Quantity    *domain.Decimal `json:"quantity,omitempty"`
+	TaxAmount   *domain.Money   `json:"tax_amount,omitempty"`
 }
 
 // OpError is a client error in an operation list (unknown item, missing field...).
@@ -43,29 +73,64 @@ type OpError struct {
 
 func (e *OpError) Error() string { return fmt.Sprintf("operation %d: %s", e.Index, e.Message) }
 
-// Command is one executable edit. Each op in the request decodes into its own
-// Command type (the Command pattern), so adding an op means adding a type and a
-// registry entry, and Apply never grows.
+// Command is one executable edit. The wire format is a single Operation struct, but
+// each op name maps to its own Command type with its own fields and Execute, so
+// adding an op means adding a type and a registry entry, and Apply never grows.
 type Command interface {
 	Execute(w *worksheet) error
 }
 
-// commands maps the wire name of an op to the constructor of its Command.
-var commands = map[string]func(Operation) Command{
-	"update": func(o Operation) Command { return updateCmd(o) },
-	"merge":  func(o Operation) Command { return mergeCmd(o) },
-	"split":  func(o Operation) Command { return splitCmd(o) },
-	"add":    func(o Operation) Command { return addCmd(o) },
-	"delete": func(o Operation) Command { return deleteCmd(o) },
+type commandSpec struct {
+	fields []string // the Operation fields this op accepts, besides "op"
+	build  func(Operation) Command
 }
 
-// Command decodes the operation into its executable form.
+// commands maps the wire name of an op to its Command and the fields it takes.
+var commands = map[string]commandSpec{
+	"update": {[]string{"item_id", "description", "amount", "quantity", "tax_amount"}, func(o Operation) Command { return updateCmd(o) }},
+	"merge":  {[]string{"item_ids", "description", "amount"}, func(o Operation) Command { return mergeCmd(o) }},
+	"split":  {[]string{"item_id", "into"}, func(o Operation) Command { return splitCmd(o) }},
+	"add":    {[]string{"description", "amount", "quantity", "tax_amount"}, func(o Operation) Command { return addCmd(o) }},
+	"delete": {[]string{"item_id"}, func(o Operation) Command { return deleteCmd(o) }},
+}
+
+// Command decodes the operation into its executable form. A field the op does not
+// use is rejected rather than silently ignored ({"op":"delete","amount":5} is a
+// client bug, not a delete).
 func (o Operation) Command() (Command, error) {
-	mk, ok := commands[o.Op]
+	spec, ok := commands[o.Op]
 	if !ok {
 		return nil, opFail("UNKNOWN_OP", "unknown op %q (want update, merge, split, add, delete)", o.Op)
 	}
-	return mk(o), nil
+	for _, f := range o.setFields() {
+		if !slices.Contains(spec.fields, f) {
+			return nil, opFail("UNEXPECTED_FIELD", "%s does not take %s", o.Op, f)
+		}
+	}
+	return spec.build(o), nil
+}
+
+func (o Operation) setFields() []string {
+	var set []string
+	if o.present != nil {
+		for k := range o.present {
+			if k != "op" {
+				set = append(set, k)
+			}
+		}
+		slices.Sort(set)
+		return set
+	}
+	for name, isSet := range map[string]bool{
+		"item_id": o.ItemID != "", "item_ids": o.ItemIDs != nil, "description": o.Description != nil,
+		"amount": o.Amount != nil, "quantity": o.Quantity != nil, "tax_amount": o.TaxAmount != nil, "into": o.Into != nil,
+	} {
+		if isSet {
+			set = append(set, name)
+		}
+	}
+	slices.Sort(set)
+	return set
 }
 
 // worksheet is the working copy the commands edit.
@@ -97,7 +162,8 @@ func Apply(items []domain.LineItem, ops []Operation, newID func() string) ([]dom
 			err = cmd.Execute(w)
 		}
 		if err != nil {
-			if oe, ok := err.(*OpError); ok {
+			var oe *OpError
+			if errors.As(err, &oe) {
 				oe.Index = n
 			}
 			return nil, err
@@ -128,6 +194,9 @@ func (c updateCmd) Execute(w *worksheet) error {
 			return opFail("INVALID_DESCRIPTION", "description must not be empty")
 		}
 		it.Description = strings.TrimSpace(*c.Description)
+	}
+	if err := validQuantityAndTax(c.Quantity, c.TaxAmount); err != nil {
+		return opFail("INVALID_ITEM", "%s", err)
 	}
 	if c.Amount != nil {
 		it.Amount = *c.Amount
@@ -165,7 +234,11 @@ func (c mergeCmd) Execute(w *worksheet) error {
 			return err
 		}
 		first = min(first, i)
-		sum += w.items[i].Amount
+		if next, ok := addChecked(sum, w.items[i].Amount, true); ok {
+			sum = next
+		} else {
+			return opFail("AMOUNT_TOO_LARGE", "merged amount is too large")
+		}
 		if t := w.items[i].TaxAmount; t != nil {
 			total := *t
 			if tax != nil {
@@ -249,10 +322,25 @@ func newItem(p NewItem, newID func() string) (domain.LineItem, error) {
 	if p.Amount == nil {
 		return domain.LineItem{}, fmt.Errorf("amount is required")
 	}
+	if err := validQuantityAndTax(p.Quantity, p.TaxAmount); err != nil {
+		return domain.LineItem{}, err
+	}
 	return domain.LineItem{
 		ID: newID(), Description: strings.TrimSpace(p.Description), Amount: *p.Amount,
 		Quantity: p.Quantity, TaxAmount: p.TaxAmount, Source: domain.SourceUser,
 	}, nil
+}
+
+// validQuantityAndTax: amounts may be negative (discounts, refunds), but a
+// quantity must be positive and an item's tax cannot be negative.
+func validQuantityAndTax(qty *domain.Decimal, tax *domain.Money) error {
+	if qty != nil && qty.Sign() <= 0 {
+		return fmt.Errorf("quantity must be greater than zero")
+	}
+	if tax != nil && *tax < 0 {
+		return fmt.Errorf("tax_amount must not be negative")
+	}
+	return nil
 }
 
 func deref(s *string) string {

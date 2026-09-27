@@ -25,9 +25,10 @@ import (
 // ErrNoText means the engine could not read any text from the file.
 var ErrNoText = errors.New("no OCR text")
 
-// Input describes the stored file to read.
+// Input is the file to read. It carries the bytes, not a path, so an engine never
+// depends on where uploads are stored.
 type Input struct {
-	Path        string // local path of the stored upload
+	Data        []byte // the uploaded file
 	Filename    string // original client file name
 	ContentType string // sniffed content type
 	SHA256      string // hex hash of the file bytes; lets decorators key on content
@@ -48,10 +49,7 @@ func (StubEngine) Name() string { return "stub-fixtures" }
 
 func (e StubEngine) ExtractText(_ context.Context, in Input) (string, error) {
 	if strings.HasPrefix(in.ContentType, "text/plain") {
-		b, err := os.ReadFile(in.Path)
-		if err != nil {
-			return "", fmt.Errorf("read upload: %w", err)
-		}
+		b := in.Data
 		if !utf8.Valid(b) || strings.TrimSpace(string(b)) == "" {
 			return "", fmt.Errorf("%w: text upload is empty or not UTF-8", ErrNoText)
 		}

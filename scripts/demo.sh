@@ -11,7 +11,8 @@ step() { printf '\n\033[1m== %s\033[0m\n' "$*"; }
 step "GET /health"
 curl -sS "$BASE/health" | jq .
 
-declare -A TXN
+# Plain variables, not an associative array: macOS still ships bash 3.2.
+txn_var() { echo "TXN_${1//-/_}"; }
 for name in receipt-clean receipt-tax-only receipt-mismatch; do
   step "POST /receipts ($name.txt)"
   RID=$(curl -sS -F "file=@$FIX/$name.txt" "$BASE/receipts" | tee /dev/stderr | jq -r .receipt_id)
@@ -24,13 +25,13 @@ for name in receipt-clean receipt-tax-only receipt-mismatch; do
     until [ "$(curl -sS "$BASE/receipts/$RID" | jq -r .status)" != PROCESSING ]; do sleep 0.2; done
     OUT=$(curl -sS "$BASE/transactions/$(curl -sS "$BASE/receipts/$RID" | jq -r .transaction_id)")
   fi
-  TXN[$name]=$(echo "$OUT" \
+  printf -v "$(txn_var "$name")" %s "$(echo "$OUT" \
     | jq -c '{id, merchant, date, currency, grand_total, taxes: [.taxes[] | {name, rate, amount, inclusive}],
               line_items: [.line_items[] | {description, amount}], itemize_status, itemize_issues}' \
-    | tee /dev/stderr | jq -r .id)
+    | tee /dev/stderr | jq -r .id)"
 done
 
-T=${TXN[receipt-clean]}
+T=$TXN_receipt_clean
 step "GET /transactions/$T"
 curl -sS -i "$BASE/transactions/$T" | sed -n '1p;/^Etag/Ip'
 
@@ -54,9 +55,10 @@ curl -sS -o /dev/null -w 'HTTP %{http_code}\n' -X PATCH "$BASE/transactions/$T/i
   -H 'Content-Type: application/json' -d '{"operations": [{"op": "update", "item_id": "'"$FIRST"'", "description": "x"}]}'
 
 step "POST /transactions/$T/itemize (re-run from stored OCR; same transaction, items replaced)"
-curl -sS -X POST "$BASE/transactions/$T/itemize" | jq -c '{id, version, itemize_status, line_items: [.line_items[] | {description, amount, source}]}'
+V=$(curl -sS "$BASE/transactions/$T" | jq -r .version)
+curl -sS -X POST "$BASE/transactions/$T/itemize" -H "If-Match: \"$V\"" | jq -c '{id, version, itemize_status, line_items: [.line_items[] | {description, amount, source}]}'
 
-T=${TXN[receipt-tax-only]}
+T=$TXN_receipt_tax_only
 step "PATCH tax-only receipt: add the fare the receipt implies (NEEDS_REVIEW -> COMPLETE)"
 curl -sS -X PATCH "$BASE/transactions/$T/items" -H 'Content-Type: application/json' \
   -d '{"operations": [{"op": "add", "description": "Trip fare", "amount": 24.00}]}' | jq -c '{itemize_status, line_items: [.line_items[] | {description, amount}]}'

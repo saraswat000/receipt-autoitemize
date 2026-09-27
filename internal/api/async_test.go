@@ -58,14 +58,11 @@ func newAsyncEnv(t *testing.T, engine ocr.Engine, workers, queueSize int) *async
 	t.Helper()
 	dir := t.TempDir()
 	st := openRepo(t, dir)
-	uploads := filepath.Join(dir, "uploads")
-	os.MkdirAll(uploads, 0o755)
-
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	svc := service.New(st, engine, uploads)
+	svc := service.New(st, engine, disk(t, dir), log)
 	pool := worker.New(worker.Config{
 		Workers: workers, QueueSize: queueSize, JobTimeout: 5 * time.Second, MaxAttempts: 2, Backoff: time.Millisecond,
-	}, svc.WorkerHandler(), log)
+	}, jobHandler(svc), log)
 	pool.Start()
 	svc.UseQueue(pool)
 	t.Cleanup(func() { pool.Shutdown(context.Background()) }) // runs before st.Close
@@ -222,12 +219,12 @@ func TestRecoveryAfterCrash(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer st.Close()
-	uploads := filepath.Join(dir, "uploads")
-	os.MkdirAll(uploads, 0o755)
+	uploads := disk(t, dir)
 	data, _ := os.ReadFile(filepath.Join(fixtures, "receipt-clean.txt"))
 
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	// Before the "crash".
-	svc := service.New(st, ocr.StubEngine{FixturesDir: fixtures}, uploads)
+	svc := service.New(st, ocr.StubEngine{FixturesDir: fixtures}, uploads, log)
 	up, err := svc.Upload(ctx, "receipt-clean.txt", "text/plain; charset=utf-8", data)
 	if err != nil {
 		t.Fatal(err)
@@ -237,14 +234,20 @@ func TestRecoveryAfterCrash(t *testing.T) {
 	}
 
 	// After restart: new service and pool over the same database.
-	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	svc2 := service.New(st, ocr.StubEngine{FixturesDir: fixtures}, uploads)
-	pool := worker.New(worker.Config{Workers: 1, QueueSize: 1, JobTimeout: time.Second, MaxAttempts: 1}, svc2.WorkerHandler(), log)
+	svc2 := service.New(st, ocr.StubEngine{FixturesDir: fixtures}, uploads, log)
+	pool := worker.New(worker.Config{Workers: 1, QueueSize: 1, JobTimeout: time.Second, MaxAttempts: 1}, jobHandler(svc2), log)
 	pool.Start()
 	defer pool.Shutdown(ctx)
 	svc2.UseQueue(pool)
 
-	n, err := svc2.RecoverPending(ctx)
+	pending, err := svc2.PendingJobs(ctx)
+	if err != nil || len(pending) != 1 {
+		t.Fatalf("pending %v, err %v", pending, err)
+	}
+	// A receipt claimed by a live request after the snapshot is not re-queued.
+	late, _ := svc2.Upload(ctx, "receipt-clean.txt", "text/plain; charset=utf-8", data)
+	st.MarkProcessing(ctx, late.ID)
+	n, err := svc2.Requeue(ctx, pending)
 	if err != nil || n != 1 {
 		t.Fatalf("recovered %d, err %v", n, err)
 	}

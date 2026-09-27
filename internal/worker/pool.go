@@ -8,7 +8,9 @@ package worker
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
+	"runtime/debug"
 	"sync"
 	"time"
 )
@@ -23,8 +25,18 @@ type Config struct {
 	QueueSize   int
 	JobTimeout  time.Duration // per attempt
 	MaxAttempts int
-	Backoff     time.Duration // doubled after each failed attempt
+	Backoff     time.Duration // doubled after each failed attempt...
+	MaxBackoff  time.Duration // ...up to this cap (default 30s)
 }
+
+// PanicError is a job that panicked. It is never retried: the same input would
+// panic again, and retrying (or re-queueing on restart) would loop forever.
+type PanicError struct {
+	Value any
+	Stack []byte
+}
+
+func (e *PanicError) Error() string { return fmt.Sprintf("job panicked: %v", e.Value) }
 
 // Handler is what the pool calls.
 type Handler struct {
@@ -32,8 +44,9 @@ type Handler struct {
 	Run func(ctx context.Context, receiptID string) error
 	// Retryable reports whether a failed attempt should be tried again.
 	Retryable func(err error) bool
-	// Fail records a job that will not be retried.
-	Fail func(ctx context.Context, receiptID string, err error)
+	// Fail records a job that will not be retried. If it cannot, the receipt stays
+	// PROCESSING and startup recovery picks it up again.
+	Fail func(ctx context.Context, receiptID string, err error) error
 }
 
 type Pool struct {
@@ -42,10 +55,9 @@ type Pool struct {
 	log  *slog.Logger
 	jobs chan string
 
-	mu      sync.RWMutex // guards stopped against concurrent Submit
-	stopped bool
+	quit     chan struct{} // closed by Shutdown: take no new jobs
+	quitOnce sync.Once
 
-	quit   chan struct{}      // closed by Shutdown: take no new jobs
 	ctx    context.Context    // parent of every attempt; cancelled if shutdown times out
 	cancel context.CancelFunc //
 	wg     sync.WaitGroup
@@ -60,6 +72,9 @@ func New(cfg Config, h Handler, log *slog.Logger) *Pool {
 	}
 	if cfg.MaxAttempts < 1 {
 		cfg.MaxAttempts = 1
+	}
+	if cfg.MaxBackoff <= 0 {
+		cfg.MaxBackoff = 30 * time.Second
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Pool{
@@ -80,9 +95,7 @@ func (p *Pool) Start() {
 // TrySubmit queues a job without blocking. It returns false when the queue is full
 // or the pool is stopping; the caller turns that into backpressure (HTTP 503).
 func (p *Pool) TrySubmit(receiptID string) bool {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	if p.stopped {
+	if p.stopping() {
 		return false
 	}
 	select {
@@ -93,26 +106,30 @@ func (p *Pool) TrySubmit(receiptID string) bool {
 	}
 }
 
+func (p *Pool) stopping() bool {
+	select {
+	case <-p.quit:
+		return true
+	default:
+		return false
+	}
+}
+
 // Submit queues a job, waiting for room. Used by startup recovery, which may have
 // more pending receipts than the queue holds.
+// jobs is never closed, so a blocked send is safe; quit and ctx unblock it. A job
+// that slips in as Shutdown starts just stays PROCESSING and is recovered later.
 func (p *Pool) Submit(ctx context.Context, receiptID string) error {
-	for {
-		if p.TrySubmit(receiptID) {
-			return nil
-		}
-		p.mu.RLock()
-		stopped := p.stopped
-		p.mu.RUnlock()
-		if stopped {
-			return ErrStopped
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-p.quit:
-			return ErrStopped
-		case <-time.After(10 * time.Millisecond):
-		}
+	if p.stopping() {
+		return ErrStopped
+	}
+	select {
+	case p.jobs <- receiptID:
+		return nil
+	case <-p.quit:
+		return ErrStopped
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 
@@ -120,12 +137,7 @@ func (p *Pool) Submit(ctx context.Context, receiptID string) error {
 // first, in-flight attempts are cancelled. Jobs still queued or cancelled keep their
 // PROCESSING status in the database and are picked up by recovery on the next start.
 func (p *Pool) Shutdown(ctx context.Context) error {
-	p.mu.Lock()
-	if !p.stopped {
-		p.stopped = true
-		close(p.quit)
-	}
-	p.mu.Unlock()
+	p.quitOnce.Do(func() { close(p.quit) })
 
 	done := make(chan struct{})
 	go func() { p.wg.Wait(); close(done) }()
@@ -161,30 +173,54 @@ func (p *Pool) loop() {
 func (p *Pool) handle(id string) {
 	backoff := p.cfg.Backoff
 	for attempt := 1; ; attempt++ {
-		ctx, cancel := context.WithTimeout(p.ctx, p.cfg.JobTimeout)
-		err := p.h.Run(ctx, id)
-		cancel()
+		err := p.attempt(id)
 		if err == nil {
 			return
 		}
-		if p.ctx.Err() != nil {
+		var panicErr *PanicError
+		isPanic := errors.As(err, &panicErr)
+		if p.ctx.Err() != nil && !isPanic {
 			// Shutdown cut this attempt short: leave the receipt PROCESSING for recovery.
 			p.log.Warn("job interrupted by shutdown", "receipt_id", id)
 			return
 		}
-		if !p.h.Retryable(err) || attempt >= p.cfg.MaxAttempts {
-			p.log.Error("job failed", "receipt_id", id, "attempt", attempt, "err", err)
+		if isPanic || !p.h.Retryable(err) || attempt >= p.cfg.MaxAttempts {
+			attrs := []any{"receipt_id", id, "attempt", attempt, "err", err}
+			if isPanic {
+				attrs = append(attrs, "stack", string(panicErr.Stack))
+			}
+			p.log.Error("job failed", attrs...)
 			failCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			p.h.Fail(failCtx, id, err)
+			if ferr := p.h.Fail(failCtx, id, err); ferr != nil {
+				p.log.Error("could not record job failure; receipt stays PROCESSING until restart", "receipt_id", id, "err", ferr)
+			}
 			cancel()
 			return
 		}
 		p.log.Warn("job attempt failed, retrying", "receipt_id", id, "attempt", attempt, "backoff", backoff, "err", err)
+		timer := time.NewTimer(backoff)
 		select {
-		case <-time.After(backoff):
-		case <-p.ctx.Done():
+		case <-timer.C:
+		case <-p.quit:
+			// Shutting down: do not hold shutdown for a backoff sleep. The receipt stays
+			// PROCESSING and the next start retries it.
+			timer.Stop()
+			p.log.Warn("job retry abandoned for shutdown", "receipt_id", id)
 			return
 		}
-		backoff *= 2
+		backoff = min(backoff*2, p.cfg.MaxBackoff)
 	}
+}
+
+// attempt runs one try with its own timeout. A panic becomes a *PanicError, so one
+// bad receipt cannot take the whole process down.
+func (p *Pool) attempt(id string) (err error) {
+	ctx, cancel := context.WithTimeout(p.ctx, p.cfg.JobTimeout)
+	defer cancel()
+	defer func() {
+		if v := recover(); v != nil {
+			err = &PanicError{Value: v, Stack: debug.Stack()}
+		}
+	}()
+	return p.h.Run(ctx, id)
 }

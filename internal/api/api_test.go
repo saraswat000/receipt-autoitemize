@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -15,6 +16,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"receipt-autoitemize/internal/api"
 	"receipt-autoitemize/internal/ocr"
@@ -22,6 +24,8 @@ import (
 	"receipt-autoitemize/internal/repository/memory"
 	"receipt-autoitemize/internal/repository/sqlite"
 	"receipt-autoitemize/internal/service"
+	"receipt-autoitemize/internal/storage"
+	"receipt-autoitemize/internal/worker"
 )
 
 const fixtures = "../../fixtures/task-a"
@@ -75,17 +79,32 @@ type env struct {
 
 func newEnv(t *testing.T) *env {
 	t.Helper()
+	return newEnvWithEngine(t, ocr.StubEngine{FixturesDir: fixtures})
+}
+
+func newEnvWithEngine(t *testing.T, engine ocr.Engine) *env {
+	t.Helper()
 	dir := t.TempDir()
 	st := openRepo(t, dir)
-	uploads := filepath.Join(dir, "uploads")
-	if err := os.MkdirAll(uploads, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	svc := service.New(st, ocr.StubEngine{FixturesDir: fixtures}, uploads)
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	svc := service.New(st, engine, disk(t, dir), log)
 	srv := httptest.NewServer(api.New(svc, log, 64<<10).Handler())
 	t.Cleanup(srv.Close)
 	return &env{t: t, srv: srv}
+}
+
+func disk(t *testing.T, dir string) *storage.Disk {
+	t.Helper()
+	d, err := storage.NewDisk(filepath.Join(dir, "uploads"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return d
+}
+
+// jobHandler mirrors the adapter in cmd/server.
+func jobHandler(svc *service.Service) worker.Handler {
+	return worker.Handler{Run: svc.RunJob, Retryable: service.Retryable, Fail: svc.FailJob}
 }
 
 // openRepo builds the backend under test. The whole HTTP suite runs against SQLite by
@@ -162,7 +181,15 @@ func (e *env) process(name string) txn {
 }
 
 func (e *env) patch(id string, ops string, headers map[string]string) (*http.Response, []byte) {
-	return e.do("PATCH", "/transactions/"+id+"/items", strings.NewReader(`{"operations":`+ops+`}`), headers)
+	return e.patchRaw(id, `{"operations":`+ops+`}`, headers)
+}
+
+func (e *env) patchRaw(id, body string, headers map[string]string) (*http.Response, []byte) {
+	h := map[string]string{"Content-Type": "application/json"}
+	for k, v := range headers {
+		h[k] = v
+	}
+	return e.do("PATCH", "/transactions/"+id+"/items", strings.NewReader(body), h)
 }
 
 func decode[T any](t *testing.T, b []byte) T {
@@ -280,6 +307,42 @@ func TestUnknownImageFailsOCR(t *testing.T) {
 	}
 }
 
+// A slow or flaky vendor is not the file's fault: sync /process answers 504 or 503,
+// and the receipt keeps its status so the client can retry.
+func TestSyncTransientOCRFailureLeavesReceiptRetryable(t *testing.T) {
+	cases := []struct {
+		name   string
+		engine ocr.Engine
+		status int
+		code   string
+	}{
+		{"timeout", ocr.Chain(newGatedEngine(false), ocr.WithTimeout(20*time.Millisecond)), 504, "OCR_TIMEOUT"},
+		{"vendor error", failingEngine{errors.New("vendor returned 502")}, 503, "OCR_UNAVAILABLE"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			e := newEnvWithEngine(t, tc.engine)
+			rid := e.uploadFixture("receipt-clean", "receipt-clean.txt")
+			res, body := e.do("POST", "/receipts/"+rid+"/process", nil, nil)
+			if res.StatusCode != tc.status || decode[apiError](t, body).Error.Code != tc.code {
+				t.Fatalf("%d %s", res.StatusCode, body)
+			}
+			if strings.Contains(string(body), "502") {
+				t.Errorf("internal error text leaked to the client: %s", body)
+			}
+			_, body = e.do("GET", "/receipts/"+rid, nil, nil)
+			if !strings.Contains(string(body), `"status": "UPLOADED"`) {
+				t.Fatalf("receipt must stay retryable: %s", body)
+			}
+		})
+	}
+}
+
+type failingEngine struct{ err error }
+
+func (failingEngine) Name() string                                             { return "failing" }
+func (f failingEngine) ExtractText(context.Context, ocr.Input) (string, error) { return "", f.err }
+
 func TestUploadValidation(t *testing.T) {
 	e := newEnv(t)
 	cases := []struct {
@@ -356,6 +419,10 @@ func TestReitemizeReplacesItemsOnly(t *testing.T) {
 	res, _ := e.patch(orig.ID, `[{"op":"update","item_id":"`+orig.Items[0].ID+`","description":"Double espresso"}]`, nil)
 	if res.StatusCode != 200 {
 		t.Fatalf("patch %d", res.StatusCode)
+	}
+	// A stale If-Match is refused; without one, re-itemize just runs.
+	if res, _ := e.do("POST", "/transactions/"+orig.ID+"/itemize", nil, map[string]string{"If-Match": `"1"`}); res.StatusCode != 412 {
+		t.Fatalf("stale If-Match: %d", res.StatusCode)
 	}
 	res, body := e.do("POST", "/transactions/"+orig.ID+"/itemize", nil, nil)
 	if res.StatusCode != 200 {
@@ -456,15 +523,40 @@ func TestPatchValidation(t *testing.T) {
 		{"bad json", `{"operations":`, 400, "INVALID_JSON"},
 		{"unknown field", `{"operations":[{"op":"delete","item_id":"x","colour":"red"}]}`, 400, "INVALID_JSON"},
 		{"sub-cent amount", `{"operations":[{"op":"add","description":"x","amount":0.001}]}`, 400, "INVALID_JSON"},
+		{"overflowing amount", `{"operations":[{"op":"add","description":"x","amount":"99999999999999999999"}]}`, 400, "INVALID_JSON"},
+		{"trailing data", `{"operations":[{"op":"delete","item_id":"x"}]} {"operations":[]}`, 400, "INVALID_JSON"},
+		{"field the op does not take", `{"operations":[{"op":"delete","item_id":"` + orig.Items[0].ID + `","amount":5}]}`, 422, "INVALID_OPERATION"},
+		{"zero quantity", `{"operations":[{"op":"add","description":"x","amount":1,"quantity":0}]}`, 422, "INVALID_OPERATION"},
+		{"negative tax", `{"operations":[{"op":"add","description":"x","amount":1,"tax_amount":-1}]}`, 422, "INVALID_OPERATION"},
+		{"delete every item", `{"operations":[` + deleteAll(orig.Items) + `]}`, 422, "NO_ITEMS"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			res, body := e.do("PATCH", "/transactions/"+orig.ID+"/items", strings.NewReader(c.body), nil)
+			res, body := e.patchRaw(orig.ID, c.body, nil)
 			if res.StatusCode != c.status || decode[apiError](t, body).Error.Code != c.code {
 				t.Fatalf("%d %s", res.StatusCode, body)
 			}
 		})
 	}
+}
+
+// `curl -d` without -H sends form-urlencoded; the JSON body must still be accepted.
+func TestPatchAcceptsCurlDefaultContentType(t *testing.T) {
+	e := newEnv(t)
+	orig := e.process("receipt-tax-only")
+	res, body := e.patchRaw(orig.ID, `{"operations":[{"op":"add","description":"Trip fare","amount":24.00}]}`,
+		map[string]string{"Content-Type": "application/x-www-form-urlencoded"})
+	if res.StatusCode != 200 {
+		t.Fatalf("%d %s", res.StatusCode, body)
+	}
+}
+
+func deleteAll(items []item) string {
+	ops := make([]string, len(items))
+	for i, it := range items {
+		ops[i] = `{"op":"delete","item_id":"` + it.ID + `"}`
+	}
+	return strings.Join(ops, ",")
 }
 
 func TestNotFoundAndHealth(t *testing.T) {
@@ -477,10 +569,12 @@ func TestNotFoundAndHealth(t *testing.T) {
 		{"POST", "/receipts/rcpt_missing/process"},
 	} {
 		body := io.Reader(nil)
+		headers := map[string]string{"X-Request-ID": "trace-123", "If-Match": `"1"`}
 		if c.method == "PATCH" {
 			body = strings.NewReader(`{"operations":[{"op":"delete","item_id":"x"}]}`)
+			headers["Content-Type"] = "application/json"
 		}
-		res, b := e.do(c.method, c.path, body, map[string]string{"X-Request-ID": "trace-123"})
+		res, b := e.do(c.method, c.path, body, headers)
 		if res.StatusCode != 404 || decode[apiError](t, b).RequestID != "trace-123" {
 			t.Errorf("%s %s: %d %s", c.method, c.path, res.StatusCode, b)
 		}

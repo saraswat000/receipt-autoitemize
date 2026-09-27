@@ -21,13 +21,14 @@ type recorder struct {
 	failed map[string]error
 }
 
-func (r *recorder) fail(_ context.Context, id string, err error) {
+func (r *recorder) fail(_ context.Context, id string, err error) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.failed == nil {
 		r.failed = map[string]error{}
 	}
 	r.failed[id] = err
+	return nil
 }
 
 func (r *recorder) get(id string) (error, bool) {
@@ -273,4 +274,65 @@ func TestSubmitWaitsForRoom(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitFor(t, func() bool { return done.Load() == 3 })
+}
+
+// A panicking job is a permanent failure: it is recorded once, never retried, and
+// the pool keeps serving other jobs. Without this, a poison receipt would crash the
+// process, stay PROCESSING, and crash it again on every restart.
+func TestPanicIsRecordedAsPermanentFailure(t *testing.T) {
+	var calls atomic.Int32
+	rec := &recorder{}
+	p := New(cfg(), Handler{
+		Run: func(_ context.Context, id string) error {
+			calls.Add(1)
+			if id == "poison" {
+				panic("boom")
+			}
+			return nil
+		},
+		Retryable: func(error) bool { return true }, Fail: rec.fail,
+	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	p.Start()
+	defer p.Shutdown(context.Background())
+
+	p.TrySubmit("poison")
+	waitFor(t, func() bool { _, ok := rec.get("poison"); return ok })
+	err, _ := rec.get("poison")
+	var pe *PanicError
+	if !errors.As(err, &pe) || pe.Value != "boom" || len(pe.Stack) == 0 {
+		t.Fatalf("recorded error = %v", err)
+	}
+	p.TrySubmit("fine")
+	waitFor(t, func() bool { return calls.Load() == 2 })
+	if n := calls.Load(); n != 2 {
+		t.Fatalf("panicking job ran %d times in total with the next job, want no retries", n)
+	}
+}
+
+// A worker sleeping between retries must not hold up shutdown.
+func TestShutdownDoesNotWaitForBackoff(t *testing.T) {
+	var calls atomic.Int32
+	rec := &recorder{}
+	c := cfg()
+	c.Backoff = time.Hour
+	p := New(c, Handler{
+		Run:       func(context.Context, string) error { calls.Add(1); return errTransient },
+		Retryable: retryable, Fail: rec.fail,
+	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	p.Start()
+	p.TrySubmit("r1")
+	waitFor(t, func() bool { return calls.Load() == 1 })
+
+	start := time.Now()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := p.Shutdown(ctx); err != nil {
+		t.Fatalf("shutdown: %v", err)
+	}
+	if d := time.Since(start); d > time.Second {
+		t.Fatalf("shutdown waited %s for a backoff sleep", d)
+	}
+	if _, failed := rec.get("r1"); failed {
+		t.Fatal("an interrupted retry must stay PROCESSING for recovery, not be failed")
+	}
 }

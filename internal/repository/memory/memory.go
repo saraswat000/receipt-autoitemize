@@ -101,7 +101,7 @@ func (r *Repo) MarkProcessing(_ context.Context, id string) (domain.ReceiptStatu
 	if prev == domain.ReceiptProcessing {
 		return prev, false, nil
 	}
-	rc.Status, rc.OCRError = domain.ReceiptProcessing, nil
+	rc.Status = domain.ReceiptProcessing
 	r.receipts[id] = rc
 	return prev, true, nil
 }
@@ -184,6 +184,12 @@ func (r *Repo) SaveProcessed(_ context.Context, o domain.OCRResult, t domain.Tra
 	if _, dup := r.ocr[o.ID]; dup {
 		return "", fmt.Errorf("ocr result %s already exists", o.ID)
 	}
+	if _, hasTxn := r.txnForReceipt[o.ReceiptID]; !hasTxn {
+		if other, dup := r.txns[t.ID]; dup && other.ReceiptID != o.ReceiptID {
+			// SQLite refuses this through the primary key; so must we.
+			return "", fmt.Errorf("transaction %s already exists for another receipt", t.ID)
+		}
+	}
 	// All checks passed; the writes below cannot fail, so the save is atomic.
 	o.CreatedAt = norm(o.CreatedAt)
 	r.ocr[o.ID] = o
@@ -228,7 +234,8 @@ func (r *Repo) ReplaceItems(_ context.Context, txnID string, expectedVersion int
 // Callers get and give values that share no memory with the repository, the same
 // isolation a real database provides.
 
-func norm(t time.Time) time.Time { return t.UTC().Round(0) }
+// norm matches what SQLite stores: UTC, millisecond precision (epoch ms).
+func norm(t time.Time) time.Time { return t.UTC().Truncate(time.Millisecond) }
 
 func timePtr(t time.Time) *time.Time { t = norm(t); return &t }
 

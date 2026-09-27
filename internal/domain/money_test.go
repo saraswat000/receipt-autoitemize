@@ -59,3 +59,21 @@ func TestRate(t *testing.T) {
 		}
 	}
 }
+
+// Any amount ParseMoney accepts must print back to a value that parses to the same
+// cents, and nothing may overflow into a wrong sign.
+func FuzzParseMoney(f *testing.F) {
+	for _, s := range []string{"0", "3.50", "-1,9", "24", "99999999999999999999", "+.5", "1e3"} {
+		f.Add(s)
+	}
+	f.Fuzz(func(t *testing.T, s string) {
+		m, err := ParseMoney(s)
+		if err != nil {
+			return
+		}
+		back, err := ParseMoney(m.String())
+		if err != nil || back != m {
+			t.Fatalf("%q -> %d -> %q -> %d %v", s, m, m.String(), back, err)
+		}
+	})
+}

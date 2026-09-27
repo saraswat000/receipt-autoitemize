@@ -4,6 +4,15 @@ A small Go HTTP API. You upload a receipt, it is processed, and the service stor
 
 > **OCR is stubbed.** No OCR or LLM vendor is called and no API key is needed. Plain-text uploads (the fixture `.txt` files) are treated as the OCR output, and an image or PDF named after a fixture (e.g. `receipt-clean.jpg`) returns that fixture's text. The engine sits behind an interface (`internal/ocr`), so a real one can be dropped in.
 
+## For reviewers
+
+| | |
+|---|---|
+| Run it | `make run` (Go 1.25+) or `make docker`, then use the curls below, in order |
+| Test it | `make test`: unit, gold (`gold.json`), repository contract and end-to-end HTTP tests, all with `-race`, on both storage backends |
+| Architecture | [docs/architecture.pdf](docs/architecture.pdf) (8 pages with diagrams: layers, data model, flows, invariants, failure handling, patterns, testing, tradeoffs), or the shorter [ARCHITECTURE.md](ARCHITECTURE.md) |
+| OCR / LLM vendor | none: OCR is stubbed, no API keys (see the note above) |
+
 ## Run
 
 Requires Go 1.25+ (older Go toolchains download 1.25 automatically).
@@ -31,13 +40,13 @@ make demo         # with the server running: walks every endpoint on the 3 fixtu
 | `PROCESS_MODE` | `sync` | `async` returns `202` from `/process` and runs OCR on a worker pool |
 | `OCR_WORKERS` | `4` | async: OCR jobs running at once (caps vendor concurrency) |
 | `OCR_QUEUE_SIZE` | `100` | async: jobs that may wait before `/process` answers `503` |
-| `OCR_TIMEOUT` | `30s` | timeout per OCR call (and per async attempt) |
+| `OCR_TIMEOUT` | `30s` | timeout per OCR call; an async attempt gets 10s more to read the file and save |
 | `OCR_CACHE_SIZE` | `1000` | OCR results kept in an LRU keyed by file hash; `0` turns it off |
 | `OCR_MAX_ATTEMPTS` | `3` | async: attempts per job, with exponential backoff from 1s |
 
 ## API and example curls
 
-All errors share one shape: `{"error": {"code", "message", "details"}, "request_id"}`. Each response carries an `X-Request-ID` header, and a caller-supplied one is propagated.
+All errors share one shape: `{"error": {"code", "message", "details"}, "request_id"}`, including unknown routes (`404`) and wrong methods (`405` with `Allow`). Each response carries an `X-Request-ID` header, a caller-supplied one is propagated, and it appears on every log line of the request.
 
 ### `GET /health`
 
@@ -90,7 +99,7 @@ The mismatch fixture keeps its total and its two items and explains the problem:
                     "computed_total": 11.90, "grand_total": 18.50, "difference": 6.60, ...}]
 ```
 
-Errors: `404` for an unknown receipt, and `422 OCR_FAILED` when the stub has no text for the file. In that case the receipt is marked `OCR_FAILED`.
+Errors: `404` for an unknown receipt, and `422 OCR_FAILED` when the stub has no text for the file. In that case the receipt is marked `OCR_FAILED`. A transient failure is not the file's fault, so it leaves the receipt unchanged for a retry: `504 OCR_TIMEOUT` when OCR exceeds `OCR_TIMEOUT`, and `503 OCR_UNAVAILABLE` (with `Retry-After`) for other vendor errors. Sync and async use the same rule (`service.Retryable`) to decide what is permanent.
 
 In async mode (`PROCESS_MODE=async`) this returns **`202 Accepted`** with the receipt (`"status": "PROCESSING"`) and a `Location: /receipts/{id}` header. Poll that URL until the status is `PROCESSED` (then `transaction_id` is set) or `OCR_FAILED`. Calling it again while the receipt is `PROCESSING` returns 202 without queuing a second job. When the queue is full it returns `503 QUEUE_FULL` with `Retry-After`, and the receipt keeps its previous status.
 
@@ -116,7 +125,7 @@ curl -si localhost:8080/transactions/$TID      # ETag: "1"
 
 ### `POST /transactions/{id}/itemize`: re-run auto-itemize from the stored OCR
 
-This replaces the line items only, including any user edits. The header, the taxes and the transaction ID stay the same. `If-Match` is optional.
+This replaces the line items only, including any user edits. The header, the taxes and the transaction ID stay the same. `If-Match` is optional; send the ETag to make sure you are not discarding an edit you haven't seen (a stale one gets `412`).
 
 ```bash
 curl -s -X POST localhost:8080/transactions/$TID/itemize
@@ -137,20 +146,26 @@ The body holds a list of operations that are applied in order and **all-or-nothi
 Amounts may be JSON numbers or strings, and anything finer than a cent is rejected. Send `If-Match: "<version>"` from the ETag to guard against lost updates.
 
 ```bash
-IDS=($(curl -s localhost:8080/transactions/$TID | jq -r '.line_items[].id'))
+# Plain variables (no arrays), so this pastes the same into bash and zsh.
+T=$(curl -s localhost:8080/transactions/$TID)
+ESPRESSO=$(echo "$T" | jq -r '.line_items[0].id')
+SANDWICH=$(echo "$T" | jq -r '.line_items[1].id')
+WATER=$(echo "$T" | jq -r '.line_items[2].id')
+V=$(echo "$T" | jq .version)   # the ETag value
 
-# Merge espresso + water, split the sandwich: still reconciles -> 200, version 2
+# Merge espresso + water, split the sandwich: still reconciles -> 200, version V+1
 curl -s -X PATCH localhost:8080/transactions/$TID/items \
-  -H 'Content-Type: application/json' -H 'If-Match: "1"' \
+  -H 'Content-Type: application/json' -H "If-Match: \"$V\"" \
   -d '{"operations": [
-        {"op": "merge", "item_ids": ["'${IDS[0]}'", "'${IDS[2]}'"], "description": "Drinks"},
-        {"op": "split", "item_id": "'${IDS[1]}'", "into": [
+        {"op": "merge", "item_ids": ["'$ESPRESSO'", "'$WATER'"], "description": "Drinks"},
+        {"op": "split", "item_id": "'$SANDWICH'", "into": [
           {"description": "Bread", "amount": 4.40}, {"description": "Filling", "amount": 4.50}]}
       ]}'
 
-# Breaks the total -> 409, nothing saved
+# Breaks the total -> 409, nothing saved (the first item is now "Drinks")
+DRINKS=$(curl -s localhost:8080/transactions/$TID | jq -r '.line_items[0].id')
 curl -s -X PATCH localhost:8080/transactions/$TID/items -H 'Content-Type: application/json' \
-  -d '{"operations": [{"op": "update", "item_id": "'${IDS[0]}'", "amount": 9.99}]}'
+  -d '{"operations": [{"op": "update", "item_id": "'$DRINKS'", "amount": 9.99}]}'
 ```
 
 ```json
@@ -161,7 +176,7 @@ curl -s -X PATCH localhost:8080/transactions/$TID/items -H 'Content-Type: applic
               "proposed_line_items": [...]}}}
 ```
 
-The status codes are `200` when saved (itemize status becomes `COMPLETE`), `409` when the items don't reconcile, `412` when `If-Match` is stale, `422` for an invalid operation such as an unknown `item_id`, `400` for malformed JSON or unknown fields, and `404` for an unknown transaction.
+The status codes are `200` when saved (itemize status becomes `COMPLETE`), `409 ITEMS_DO_NOT_RECONCILE` when the items don't add up, `412` when `If-Match` is stale, `409 CONCURRENT_UPDATE` when no `If-Match` was sent and another write won the race, `422` for an invalid operation (an unknown `item_id`, a field the op does not take such as `amount` on `delete`, a quantity of zero, a negative `tax_amount`) or for edits that leave no items (`NO_ITEMS`) or target a transaction without a total (`NO_TOTAL`), `400` for malformed JSON, unknown fields or trailing data, and `404` for an unknown transaction.
 
 A tax-only receipt can be resolved by the user, for example:
 `{"operations": [{"op": "add", "description": "Trip fare", "amount": 24.00}]}` moves it from `NEEDS_REVIEW` to `COMPLETE`.
@@ -183,7 +198,7 @@ The service depends only on `repository.Repository`, an interface grouping `Rece
 - `repository/sqlite`, the default, with foreign keys, a UNIQUE constraint, CHECK constraints and a SQL transaction per write.
 - `repository/memory`, a mutex-guarded in-memory store (`make run-memory`). It proves the boundary is real, and it's handy for tests.
 
-`repository/repotest` is the **contract suite**: 12 tests covering round trips, one transaction per receipt, in-place re-process, optimistic locking, atomic claim, crash-recovery ordering, isolation of returned values and concurrent writers. Both implementations run it, and `make test` also runs the whole HTTP suite against each backend. To add Postgres or DynamoDB, write a package that passes `repotest.Run` and add a case to `openRepository` in `cmd/server`. Nothing else changes.
+`repository/repotest` is the **contract suite**: 15 tests covering round trips, one transaction per receipt, in-place re-process, optimistic locking, atomic claim, crash-recovery ordering, sub-second timestamp ordering, reads during concurrent writes (no torn aggregates), transaction-ID collisions, isolation of returned values and concurrent writers. Both implementations run it, and `make test` also runs the whole HTTP suite against each backend. To add Postgres or DynamoDB, write a package that passes `repotest.Run` and add a case to `openRepository` in `cmd/server`. Nothing else changes.
 
 Transaction is treated as an aggregate: its header, taxes and items are always read and written together (`SaveProcessed`, `ReplaceItems`), so a backend can't leave half a transaction behind.
 
@@ -194,7 +209,7 @@ With the stub, OCR is instant, so sync is the default and the brief's curls retu
 - `/process` atomically marks the receipt `PROCESSING` in the database and hands its ID to a buffered channel. A **fixed pool** of `OCR_WORKERS` goroutines reads the channel, which caps concurrent vendor calls.
 - Each attempt runs with a timeout. Transient errors are retried with exponential backoff; permanent ones (the file has no readable text) fail at once and mark the receipt `OCR_FAILED`.
 - **The database is the durable queue, and the channel is only a hand-off.** On startup, every receipt still in `PROCESSING` (left by a crash or an unfinished shutdown) is re-queued.
-- **The save is idempotent** (an upsert on `receipt_id`), so a job that runs twice still yields one transaction. A duplicate `/process` call doesn't queue a second job, because claiming the receipt is a single conditional update.
+- **The save is idempotent** (an upsert on `receipt_id`), so a job that runs twice still yields one transaction. A duplicate `/process` call doesn't queue a second job, because claiming the receipt is a conditional `UPDATE … WHERE status <> 'PROCESSING'` (exactly one caller sees a row change, on any database). If recording a failed job itself fails (the database is down), the receipt stays `PROCESSING` until the next start, when recovery re-queues it. Claims have no lease on purpose: an expiring claim needs a fencing token carried with the job, or a stale job can overwrite newer results (a production follow-up).
 - **Backpressure:** a full queue returns `503` with `Retry-After` instead of blocking or starting unbounded goroutines.
 - **Graceful shutdown:** HTTP stops first, then workers finish the jobs they are running within the deadline. Queued jobs stay `PROCESSING` and resume on the next start.
 
@@ -207,13 +222,12 @@ Each pattern is here because it solves a problem in this code, not for show.
 | Pattern | Where | What it buys |
 |---|---|---|
 | Repository | `internal/repository` | The service never sees a database; backends are swappable and share one contract suite |
-| Strategy | `ocr.Engine`, `repository.Repository` | Stub OCR today, a vendor or VLM tomorrow; SQLite or memory chosen at start |
+| Strategy (interfaces chosen at startup) | `ocr.Engine`, `repository.Repository`, `service.FileStore`; picked in `cmd/server` (`openRepository`) | Stub OCR today, a vendor or VLM tomorrow; SQLite or memory; local disk or S3 |
 | Decorator | `ocr.Chain` with `WithLogging`, `WithCache`, `WithTimeout` (`internal/ocr/middleware.go`) | Cross-cutting concerns around the vendor call without touching the engine or the service |
-| Command | PATCH operations (`internal/itemize/ops.go`) | Each op is its own type with `Execute`; a registry decodes them, so a new op is a new type, not a longer switch |
-| Factory | `openRepository` in `cmd/server` | The only place that knows which database is used |
-| Adapter | `Service.WorkerHandler()` | Plugs service use cases into the generic `worker.Pool` without the pool importing the service |
+| Command | PATCH operations (`internal/itemize/ops.go`) | Each op is its own type with `Execute` and its own accepted fields; a registry maps the wire name to it, so a new op is a new type, not a longer switch. The ops share one wire struct for decoding, so this is a light version of the pattern |
+| Adapter | `jobHandler` in `cmd/server` | Plugs `Service.RunJob`/`FailJob` into the generic `worker.Pool`; neither package imports the other |
 | Producer–consumer / worker pool | `internal/worker` | Bounded concurrency, backpressure, retries |
-| Chain of responsibility | HTTP middleware (`internal/api/middleware.go`) | Request ID, panic recovery and access log wrap every handler |
+| Chain of responsibility | HTTP middleware (`internal/api/middleware.go`) | Request ID, access log and panic recovery wrap every handler; the access log sits outside recovery so a panicking request is still logged |
 | Value object | `domain.Money`, `domain.Rate` | Exact integer arithmetic; parsing and JSON in one place |
 | Optimistic locking | `version` column, `ETag`/`If-Match` | No lost updates without holding locks |
 
@@ -224,9 +238,11 @@ Considered and left out: a state machine for receipt status (almost every transi
 - **Items are net.** An item amount excludes added-on tax, which matches `gold.json`. The reconciliation rule is `sum(items) + sum(non-inclusive taxes) == grand_total` with a tolerance of 1 cent. Inclusive taxes such as "incl. VAT" are already inside the prices, so they are not added.
 - **The tax-only receipt gets no fallback item.** Gold allows one item equal to the total, but an invented line is exactly what the brief warns against. It stays `NEEDS_REVIEW` with empty items, and the user adds the line through PATCH.
 - **The printed subtotal is checked at process time** (`SUBTOTAL_MISMATCH`) to catch OCR that dropped a line. It is not enforced on user edits, because the grand total is the invariant there.
-- **Re-itemize replaces user edits.** The brief says "replace line items". Every item carries `source` (`AUTO` or `USER`), so a client can warn before calling it.
-- **Money is int64 cents and rates are int64 basis points.** No floats touch amounts, and anything finer than a cent is rejected rather than rounded. Two-decimal currencies are assumed.
+- **Re-itemize replaces user edits.** The brief says "replace line items". Every item carries `source` (`AUTO` or `USER`), so a client can warn before calling it, and can send `If-Match` so it never clobbers an edit it has not seen.
+- **Re-processing rebuilds the transaction too**, from a fresh OCR run, so it also replaces edited items. That is the point of re-processing (the OCR input changed), and the old OCR row is kept. A production version would require `If-Match` on `/process` once a transaction has `USER` items; it is left out here to keep `/process` a plain retryable command. If a re-process fails permanently, the receipt shows `OCR_FAILED` while its previous transaction stays readable and unchanged.
+- **No floats anywhere.** Money is int64 cents; anything finer than a cent is rejected rather than rounded, and two-decimal currencies are assumed (0- and 3-decimal currencies such as JPY and KWD would take their exponent from ISO 4217). Tax rates and quantities are exact decimals (value and power of ten), so 19.123% or 1.125 kg are kept as printed. Instants are stored as epoch milliseconds (UTC) and returned as ISO-8601; the receipt date is a plain `YYYY-MM-DD`. SQLite tables are `STRICT`.
 - **Dates** accept ISO and day-first `DD.MM.YYYY`. Ambiguous slash dates are left `null` rather than guessed.
+- **Beyond the fixtures, the parser also handles** tax lines written "Total VAT" or "19% VAT", German summary and payment lines (Summe, Zwischensumme, MwSt, Bar, Rückgeld), and tip or rounding lines, which count toward the total but not the printed subtotal. Amount sums are overflow-checked.
 
 ## Layout
 
@@ -236,14 +252,18 @@ internal/domain     Money, Rate, Receipt, Transaction, TaxLine, LineItem, status
 internal/ocr        Engine interface, StubEngine, decorators (timeout, cache, logging)
 internal/extract    OCR text -> header, taxes, proposed items (pure)
 internal/itemize    Reconcile rules + PATCH operations as commands (pure)
-internal/service    use cases: upload, process, re-itemize, patch
+internal/service    use cases: upload, process, re-itemize, patch (no HTTP, SQL, disk or pool imports)
+internal/storage    FileStore implementation: local disk (S3 would sit beside it)
+internal/id         prefixed random IDs
+internal/reqid      request ID in the context + slog handler that stamps it on every log line
 internal/repository persistence contract (interfaces + errors) the service depends on
-  ├─ sqlite         SQLite implementation (schema.sql embedded), transactional writes
+  ├─ sqlite         SQLite implementation, transactional writes, versioned migrations (migrations/*.sql)
   ├─ memory         in-memory implementation
   └─ repotest       contract test suite every implementation must pass
 internal/worker     bounded goroutine pool: retries, timeouts, graceful shutdown
-internal/api        HTTP handlers, error mapping, middleware
+internal/api        HTTP handlers, error mapping, middleware; depends on the api.Service interface
 fixtures/task-a     brief fixtures + gold.json
+docs                architecture.pdf (for review) and its HTML source
 ```
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the data model, the tradeoffs, and what would change for production.

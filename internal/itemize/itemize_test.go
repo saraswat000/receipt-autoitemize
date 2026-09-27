@@ -29,14 +29,14 @@ func TestReconcile(t *testing.T) {
 		status domain.ItemizeStatus
 		codes  []string
 	}{
-		{"net items + added tax", Input{items(350, 890, 260), addedVAT, m(1785), m(1500)}, domain.ItemizeComplete, nil},
-		{"one cent rounding tolerated", Input{items(350, 890, 259), addedVAT, m(1785), nil}, domain.ItemizeComplete, nil},
-		{"two cents is a mismatch", Input{items(350, 890, 258), addedVAT, m(1785), nil}, domain.ItemizeNeedsReview, []string{"TOTAL_MISMATCH"}},
-		{"gross items + inclusive tax", Input{items(2400), inclVAT, m(2400), nil}, domain.ItemizeComplete, nil},
-		{"no items", Input{nil, inclVAT, m(2400), nil}, domain.ItemizeNeedsReview, []string{"NO_ITEMS"}},
-		{"no total", Input{items(100), nil, nil, nil}, domain.ItemizeFailed, []string{"NO_TOTAL"}},
-		{"mismatch fixture", Input{items(400, 600), []domain.TaxLine{{Name: "VAT", Amount: 190}}, m(1850), m(1000)}, domain.ItemizeNeedsReview, []string{"TOTAL_MISMATCH"}},
-		{"subtotal disagrees", Input{items(350, 890), addedVAT, m(1525), m(1500)}, domain.ItemizeNeedsReview, []string{"SUBTOTAL_MISMATCH"}},
+		{"net items + added tax", Input{items(350, 890, 260), addedVAT, m(1785), m(1500), 0}, domain.ItemizeComplete, nil},
+		{"one cent rounding tolerated", Input{items(350, 890, 259), addedVAT, m(1785), nil, 0}, domain.ItemizeComplete, nil},
+		{"two cents is a mismatch", Input{items(350, 890, 258), addedVAT, m(1785), nil, 0}, domain.ItemizeNeedsReview, []string{"TOTAL_MISMATCH"}},
+		{"gross items + inclusive tax", Input{items(2400), inclVAT, m(2400), nil, 0}, domain.ItemizeComplete, nil},
+		{"no items", Input{nil, inclVAT, m(2400), nil, 0}, domain.ItemizeNeedsReview, []string{"NO_ITEMS"}},
+		{"no total", Input{items(100), nil, nil, nil, 0}, domain.ItemizeFailed, []string{"NO_TOTAL"}},
+		{"mismatch fixture", Input{items(400, 600), []domain.TaxLine{{Name: "VAT", Amount: 190}}, m(1850), m(1000), 0}, domain.ItemizeNeedsReview, []string{"TOTAL_MISMATCH"}},
+		{"subtotal disagrees", Input{items(350, 890), addedVAT, m(1525), m(1500), 0}, domain.ItemizeNeedsReview, []string{"SUBTOTAL_MISMATCH"}},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -57,7 +57,7 @@ func TestReconcile(t *testing.T) {
 }
 
 func TestReconcileMismatchDetails(t *testing.T) {
-	_, issues := Reconcile(Input{items(400, 600), []domain.TaxLine{{Amount: 190}}, m(1850), nil})
+	_, issues := Reconcile(Input{items(400, 600), []domain.TaxLine{{Amount: 190}}, m(1850), nil, 0})
 	got := issues[0]
 	if *got.ComputedTotal != 1190 || *got.GrandTotal != 1850 || *got.Difference != 660 {
 		t.Fatalf("details = %+v", got)

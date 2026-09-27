@@ -72,7 +72,7 @@ type LineItem struct {
 	ID          string     `json:"id"`
 	Description string     `json:"description"`
 	Amount      Money      `json:"amount"`
-	Quantity    *float64   `json:"quantity"`
+	Quantity    *Decimal   `json:"quantity"` // exact; stored as quantity_value / quantity_scale
 	TaxAmount   *Money     `json:"tax_amount"`
 	Source      ItemSource `json:"source"`
 }

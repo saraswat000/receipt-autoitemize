@@ -5,10 +5,12 @@ package sqlite
 import (
 	"context"
 	"database/sql"
-	_ "embed"
+	"embed"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
+	"sort"
 	"time"
 
 	"receipt-autoitemize/internal/domain"
@@ -17,8 +19,11 @@ import (
 	_ "modernc.org/sqlite" // pure-Go driver: no cgo, so `go run` and Docker just work
 )
 
-//go:embed schema.sql
-var schema string
+// Migrations are applied in file-name order, each in its own transaction, and the
+// applied count is kept in PRAGMA user_version. Never edit a released file; add one.
+//
+//go:embed migrations/*.sql
+var migrationFS embed.FS
 
 // Aliases so callers can match errors from either package.
 var (
@@ -39,13 +44,54 @@ func Open(ctx context.Context, path string) (*Store, error) {
 		return nil, err
 	}
 	// SQLite allows one writer at a time; a single connection serialises writes
-	// cleanly instead of surfacing SQLITE_BUSY under concurrent requests.
+	// cleanly instead of surfacing SQLITE_BUSY under concurrent requests. It also
+	// serialises reads, which is the scalability ceiling of this backend (see
+	// ARCHITECTURE.md); Postgres is the answer, not more SQLite connections.
 	db.SetMaxOpenConns(1)
-	if _, err := db.ExecContext(ctx, schema); err != nil {
+	if err := migrate(ctx, db); err != nil {
 		db.Close()
-		return nil, fmt.Errorf("apply schema: %w", err)
+		return nil, err
 	}
 	return &Store{db: db}, nil
+}
+
+func migrate(ctx context.Context, db *sql.DB) error {
+	names, err := fs.Glob(migrationFS, "migrations/*.sql")
+	if err != nil {
+		return err
+	}
+	sort.Strings(names)
+	var version int
+	if err := db.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&version); err != nil {
+		return fmt.Errorf("read schema version: %w", err)
+	}
+	if version > len(names) {
+		return fmt.Errorf("database schema version %d is newer than this binary (%d migrations)", version, len(names))
+	}
+	for i := version; i < len(names); i++ {
+		body, err := migrationFS.ReadFile(names[i])
+		if err != nil {
+			return err
+		}
+		tx, err := db.BeginTx(ctx, nil)
+		if err != nil {
+			return err
+		}
+		_, err = tx.ExecContext(ctx, string(body))
+		if err == nil {
+			// PRAGMA takes no bind parameters; i+1 is an int we control.
+			_, err = tx.ExecContext(ctx, fmt.Sprintf(`PRAGMA user_version = %d`, i+1))
+		}
+		if err == nil {
+			err = tx.Commit()
+		} else {
+			_ = tx.Rollback()
+		}
+		if err != nil {
+			return fmt.Errorf("migration %s: %w", names[i], err)
+		}
+	}
+	return nil
 }
 
 func (s *Store) Close() error                   { return s.db.Close() }
@@ -76,8 +122,8 @@ func (s *Store) CreateReceipt(ctx context.Context, r domain.Receipt) error {
 func (s *Store) GetReceipt(ctx context.Context, id string) (domain.Receipt, error) {
 	var (
 		r         domain.Receipt
-		created   string
-		processed sql.NullString
+		created   int64
+		processed sql.NullInt64
 		ocrErr    sql.NullString
 	)
 	err := s.db.QueryRowContext(ctx, `
@@ -92,7 +138,7 @@ func (s *Store) GetReceipt(ctx context.Context, id string) (domain.Receipt, erro
 	}
 	r.CreatedAt = parseTS(created)
 	if processed.Valid {
-		t := parseTS(processed.String)
+		t := parseTS(processed.Int64)
 		r.ProcessedAt = &t
 	}
 	if ocrErr.Valid {
@@ -120,23 +166,26 @@ func (s *Store) MarkReceiptFailed(ctx context.Context, id, reason string, at tim
 	return err
 }
 
-// MarkProcessing atomically moves a receipt to PROCESSING unless it already is, and
-// returns the status it had before. claimed is false when another request already
-// queued it, which is how duplicate process calls are collapsed into one job.
+// MarkProcessing claims a receipt for processing. The conditional UPDATE is what
+// makes the claim atomic (on any database, not only because SQLite has one
+// connection): exactly one caller sees a row affected. claimed is false when the
+// receipt is already PROCESSING, which collapses duplicate process calls into one job.
 func (s *Store) MarkProcessing(ctx context.Context, id string) (prev domain.ReceiptStatus, claimed bool, err error) {
 	err = s.inTx(ctx, func(tx *sql.Tx) error {
+		// prev is only used to undo the claim (RestoreStatus), never to decide it.
 		if err := tx.QueryRowContext(ctx, `SELECT status FROM receipts WHERE id = ?`, id).Scan(&prev); err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				return ErrNotFound
 			}
 			return err
 		}
-		if prev == domain.ReceiptProcessing {
-			return nil
+		res, err := tx.ExecContext(ctx,
+			`UPDATE receipts SET status = 'PROCESSING' WHERE id = ? AND status <> 'PROCESSING'`, id)
+		if err != nil {
+			return err
 		}
-		claimed = true
-		_, err := tx.ExecContext(ctx,
-			`UPDATE receipts SET status = 'PROCESSING', ocr_error = NULL WHERE id = ?`, id)
+		n, err := res.RowsAffected()
+		claimed = n == 1
 		return err
 	})
 	return prev, claimed, err
@@ -181,7 +230,7 @@ func (s *Store) OCRByID(ctx context.Context, id string) (domain.OCRResult, error
 func (s *Store) ocrWhere(ctx context.Context, where string, arg any) (domain.OCRResult, error) {
 	var (
 		o       domain.OCRResult
-		created string
+		created int64
 	)
 	err := s.db.QueryRowContext(ctx,
 		`SELECT id, receipt_id, engine, raw_text, created_at FROM ocr_results WHERE `+where, arg).
@@ -253,14 +302,15 @@ func (s *Store) SaveProcessed(ctx context.Context, ocr domain.OCRResult, t domai
 			return err
 		}
 		for i, tl := range t.Taxes {
-			var rate any
+			var rate *domain.Decimal
 			if tl.Rate != nil {
-				rate = int64(*tl.Rate)
+				rate = &tl.Rate.Percent
 			}
+			rateValue, rateScale := decimalArgs(rate)
 			if _, err := tx.ExecContext(ctx, `
-				INSERT INTO tax_lines (id, transaction_id, position, name, rate_bp, amount_cents, inclusive, jurisdiction)
-				VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-				tl.ID, txnID, i, tl.Name, rate, int64(tl.Amount), boolInt(tl.Inclusive), tl.Jurisdiction); err != nil {
+				INSERT INTO tax_lines (id, transaction_id, position, name, rate_value, rate_scale, amount_cents, inclusive, jurisdiction)
+				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+				tl.ID, txnID, i, tl.Name, rateValue, rateScale, int64(tl.Amount), boolInt(tl.Inclusive), tl.Jurisdiction); err != nil {
 				return fmt.Errorf("insert tax: %w", err)
 			}
 		}
@@ -286,7 +336,11 @@ func (s *Store) ReplaceItems(ctx context.Context, txnID string, expectedVersion 
 		if err != nil {
 			return err
 		}
-		if n, _ := res.RowsAffected(); n == 0 {
+		n, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if n == 0 {
 			var exists int
 			if err := tx.QueryRowContext(ctx, `SELECT 1 FROM transactions WHERE id = ?`, txnID).Scan(&exists); errors.Is(err, sql.ErrNoRows) {
 				return ErrNotFound
@@ -302,26 +356,44 @@ func replaceItems(ctx context.Context, tx *sql.Tx, txnID string, items []domain.
 		return err
 	}
 	for i, it := range items {
+		qtyValue, qtyScale := decimalArgs(it.Quantity)
 		if _, err := tx.ExecContext(ctx, `
-			INSERT INTO line_items (id, transaction_id, position, description, amount_cents, quantity, tax_amount_cents, source)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-			it.ID, txnID, i, it.Description, int64(it.Amount), it.Quantity, moneyArg(it.TaxAmount), it.Source); err != nil {
+			INSERT INTO line_items (id, transaction_id, position, description, amount_cents,
+				quantity_value, quantity_scale, tax_amount_cents, source)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			it.ID, txnID, i, it.Description, int64(it.Amount), qtyValue, qtyScale, moneyArg(it.TaxAmount), it.Source); err != nil {
 			return fmt.Errorf("insert line item: %w", err)
 		}
 	}
 	return nil
 }
 
-// GetTransaction loads a transaction with its taxes and line items.
-func (s *Store) GetTransaction(ctx context.Context, id string) (domain.Transaction, error) {
+// queryer is what the read helpers need; both *sql.DB and *sql.Tx satisfy it.
+type queryer interface {
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
+
+// GetTransaction loads a transaction with its taxes and line items. The three reads
+// run in one SQL transaction, so a concurrent ReplaceItems can never pair version N's
+// header (and ETag) with version N+1's items.
+func (s *Store) GetTransaction(ctx context.Context, id string) (t domain.Transaction, err error) {
+	err = s.inTx(ctx, func(tx *sql.Tx) error {
+		t, err = getTransaction(ctx, tx, id)
+		return err
+	})
+	return t, err
+}
+
+func getTransaction(ctx context.Context, q queryer, id string) (domain.Transaction, error) {
 	var (
 		t                  domain.Transaction
 		subtotal, total    sql.NullInt64
 		issues             string
-		created, updated   string
+		created, updated   int64
 		merchant, date, cc sql.NullString
 	)
-	err := s.db.QueryRowContext(ctx, `
+	err := q.QueryRowContext(ctx, `
 		SELECT id, receipt_id, ocr_result_id, merchant, txn_date, currency, subtotal_cents, grand_total_cents,
 			itemize_status, itemize_issues, version, created_at, updated_at
 		FROM transactions WHERE id = ?`, id).
@@ -343,16 +415,16 @@ func (s *Store) GetTransaction(ctx context.Context, id string) (domain.Transacti
 		t.ItemizeIssues = []domain.Issue{}
 	}
 
-	if t.Taxes, err = s.taxes(ctx, id); err != nil {
+	if t.Taxes, err = taxes(ctx, q, id); err != nil {
 		return t, err
 	}
-	t.LineItems, err = s.items(ctx, id)
+	t.LineItems, err = items(ctx, q, id)
 	return t, err
 }
 
-func (s *Store) taxes(ctx context.Context, txnID string) ([]domain.TaxLine, error) {
-	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, name, rate_bp, amount_cents, inclusive, jurisdiction
+func taxes(ctx context.Context, q queryer, txnID string) ([]domain.TaxLine, error) {
+	rows, err := q.QueryContext(ctx, `
+		SELECT id, name, rate_value, rate_scale, amount_cents, inclusive, jurisdiction
 		FROM tax_lines WHERE transaction_id = ? ORDER BY position`, txnID)
 	if err != nil {
 		return nil, err
@@ -363,16 +435,16 @@ func (s *Store) taxes(ctx context.Context, txnID string) ([]domain.TaxLine, erro
 		var (
 			tl        domain.TaxLine
 			rate      sql.NullInt64
+			scale     sql.NullInt64
 			amount    int64
 			inclusive int
 			juris     sql.NullString
 		)
-		if err := rows.Scan(&tl.ID, &tl.Name, &rate, &amount, &inclusive, &juris); err != nil {
+		if err := rows.Scan(&tl.ID, &tl.Name, &rate, &scale, &amount, &inclusive, &juris); err != nil {
 			return nil, err
 		}
-		if rate.Valid {
-			r := domain.Rate(rate.Int64)
-			tl.Rate = &r
+		if d := decimalPtr(rate, scale); d != nil {
+			tl.Rate = &domain.Rate{Percent: *d}
 		}
 		tl.Amount, tl.Inclusive, tl.Jurisdiction = domain.Money(amount), inclusive == 1, strPtr(juris)
 		out = append(out, tl)
@@ -380,9 +452,9 @@ func (s *Store) taxes(ctx context.Context, txnID string) ([]domain.TaxLine, erro
 	return out, rows.Err()
 }
 
-func (s *Store) items(ctx context.Context, txnID string) ([]domain.LineItem, error) {
-	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, description, amount_cents, quantity, tax_amount_cents, source
+func items(ctx context.Context, q queryer, txnID string) ([]domain.LineItem, error) {
+	rows, err := q.QueryContext(ctx, `
+		SELECT id, description, amount_cents, quantity_value, quantity_scale, tax_amount_cents, source
 		FROM line_items WHERE transaction_id = ? ORDER BY position`, txnID)
 	if err != nil {
 		return nil, err
@@ -393,16 +465,14 @@ func (s *Store) items(ctx context.Context, txnID string) ([]domain.LineItem, err
 		var (
 			it     domain.LineItem
 			amount int64
-			qty    sql.NullFloat64
+			qty    sql.NullInt64
+			scale  sql.NullInt64
 			tax    sql.NullInt64
 		)
-		if err := rows.Scan(&it.ID, &it.Description, &amount, &qty, &tax, &it.Source); err != nil {
+		if err := rows.Scan(&it.ID, &it.Description, &amount, &qty, &scale, &tax, &it.Source); err != nil {
 			return nil, err
 		}
-		it.Amount, it.TaxAmount = domain.Money(amount), moneyPtr(tax)
-		if qty.Valid {
-			it.Quantity = &qty.Float64
-		}
+		it.Amount, it.TaxAmount, it.Quantity = domain.Money(amount), moneyPtr(tax), decimalPtr(qty, scale)
 		out = append(out, it)
 	}
 	return out, rows.Err()
@@ -410,11 +480,27 @@ func (s *Store) items(ctx context.Context, txnID string) ([]domain.LineItem, err
 
 // ---------------------------------------------------------------- helpers
 
-func ts(t time.Time) string { return t.UTC().Format(time.RFC3339Nano) }
+// Instants are stored as INTEGER Unix epoch milliseconds (UTC); they sort and
+// compare as numbers. Sub-millisecond precision is dropped (the memory backend
+// truncates the same way, so both backends return identical values).
+func ts(t time.Time) int64 { return t.UnixMilli() }
 
-func parseTS(s string) time.Time {
-	t, _ := time.Parse(time.RFC3339Nano, s)
-	return t
+func parseTS(ms int64) time.Time { return time.UnixMilli(ms).UTC() }
+
+// decimalArgs splits an optional exact decimal into its value and scale columns.
+func decimalArgs(d *domain.Decimal) (value, scale any) {
+	if d == nil {
+		return nil, nil
+	}
+	return d.Value, int64(d.Scale)
+}
+
+func decimalPtr(value, scale sql.NullInt64) *domain.Decimal {
+	if !value.Valid || !scale.Valid || scale.Int64 < 0 || scale.Int64 > domain.MaxDecimalScale {
+		return nil
+	}
+	d := domain.NewDecimal(value.Int64, uint8(scale.Int64))
+	return &d
 }
 
 func moneyArg(m *domain.Money) any {

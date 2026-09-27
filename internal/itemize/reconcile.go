@@ -14,6 +14,9 @@ type Input struct {
 	Taxes      []domain.TaxLine
 	GrandTotal *domain.Money
 	Subtotal   *domain.Money
+	// Adjustments are items printed after the subtotal (tip, rounding): they count
+	// toward the total but are left out of the subtotal check.
+	Adjustments domain.Money
 }
 
 // Reconcile decides the itemize status and explains it.
@@ -38,17 +41,24 @@ func Reconcile(in Input) (domain.ItemizeStatus, []domain.Issue) {
 	}
 
 	var itemsSum, addedTax domain.Money
+	ok := true
 	for _, it := range in.Items {
-		itemsSum += it.Amount
+		itemsSum, ok = addChecked(itemsSum, it.Amount, ok)
 	}
 	for _, t := range in.Taxes {
 		if !t.Inclusive {
-			addedTax += t.Amount
+			addedTax, ok = addChecked(addedTax, t.Amount, ok)
 		}
+	}
+	computed, ok := addChecked(itemsSum, addedTax, ok)
+	if !ok {
+		// int64 wrapped: a wrapped sum could land on the total by accident.
+		return domain.ItemizeFailed, []domain.Issue{{
+			Code: "AMOUNT_OVERFLOW", Message: "Line item amounts are too large to add up.",
+		}}
 	}
 
 	var issues []domain.Issue
-	computed := itemsSum + addedTax
 	if diff := *in.GrandTotal - computed; abs(diff) > Tolerance {
 		issues = append(issues, domain.Issue{
 			Code:          "TOTAL_MISMATCH",
@@ -61,7 +71,7 @@ func Reconcile(in Input) (domain.ItemizeStatus, []domain.Issue) {
 		})
 	}
 	if in.Subtotal != nil {
-		if diff := *in.Subtotal - itemsSum; abs(diff) > Tolerance {
+		if diff := *in.Subtotal - (itemsSum - in.Adjustments); abs(diff) > Tolerance {
 			issues = append(issues, domain.Issue{
 				Code:       "SUBTOTAL_MISMATCH",
 				Message:    "Line items do not equal the printed subtotal.",
@@ -75,6 +85,15 @@ func Reconcile(in Input) (domain.ItemizeStatus, []domain.Issue) {
 		return domain.ItemizeNeedsReview, issues
 	}
 	return domain.ItemizeComplete, []domain.Issue{}
+}
+
+// addChecked adds b to a, reporting false (sticky) once the int64 sum overflows.
+func addChecked(a, b domain.Money, ok bool) (domain.Money, bool) {
+	s := a + b
+	if (b > 0 && s < a) || (b < 0 && s > a) {
+		return s, false
+	}
+	return s, ok
 }
 
 func abs(m domain.Money) domain.Money {

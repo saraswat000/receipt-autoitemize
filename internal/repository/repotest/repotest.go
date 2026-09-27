@@ -8,6 +8,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -29,6 +31,7 @@ func Run(t *testing.T, newRepo Factory) {
 		{"FindDuplicate", testFindDuplicate},
 		{"MarkProcessingClaimsOnce", testMarkProcessing},
 		{"PendingReceiptsOldestFirst", testPendingReceipts},
+		{"SubSecondOrdering", testSubSecondOrdering},
 		{"MarkReceiptFailed", testMarkFailed},
 		{"SaveProcessedCreates", testSaveProcessedCreates},
 		{"SaveProcessedUpdatesInPlace", testSaveProcessedUpdates},
@@ -37,6 +40,8 @@ func Run(t *testing.T, newRepo Factory) {
 		{"ReturnedValuesAreIsolated", testIsolation},
 		{"ConcurrentSaveKeepsOneTransaction", testConcurrentSave},
 		{"ConcurrentClaimHasOneWinner", testConcurrentClaim},
+		{"TransactionIDCollisionIsRejected", testTxnIDCollision},
+		{"ReadDuringWriteIsConsistent", testReadDuringWrite},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -55,7 +60,7 @@ var (
 func receipt(id string, created time.Time, sha string) domain.Receipt {
 	return domain.Receipt{
 		ID: id, Filename: id + ".txt", ContentType: "text/plain", SizeBytes: 10,
-		SHA256: sha, StoragePath: "/tmp/" + id, Status: domain.ReceiptUploaded, CreatedAt: created,
+		SHA256: hash(sha), StoragePath: "/tmp/" + id, Status: domain.ReceiptUploaded, CreatedAt: created,
 	}
 }
 
@@ -70,7 +75,7 @@ func mustCreate(t *testing.T, r repository.Repository, rc domain.Receipt) {
 }
 
 func sampleTxn(id, receiptID string, at time.Time) domain.Transaction {
-	rate := domain.Rate(1900)
+	rate := domain.Rate{Percent: domain.NewDecimal(19123, 3)} // 19.123%: more precision than basis points
 	return domain.Transaction{
 		ID: id, ReceiptID: receiptID,
 		Merchant: str("Cafe Mitte"), Date: str("2026-03-12"), Currency: str("EUR"),
@@ -122,10 +127,10 @@ func testFindDuplicate(t *testing.T, r repository.Repository) {
 	mustCreate(t, r, receipt("new", t0.Add(2*time.Minute), "same"))
 	mustCreate(t, r, receipt("old", t0, "same"))
 	mustCreate(t, r, receipt("other", t0, "different"))
-	if id, ok, err := r.FindDuplicate(ctx, "same", "new"); err != nil || !ok || id != "old" {
+	if id, ok, err := r.FindDuplicate(ctx, hash("same"), "new"); err != nil || !ok || id != "old" {
 		t.Errorf("got %q %v %v, want oldest other receipt", id, ok, err)
 	}
-	if _, ok, _ := r.FindDuplicate(ctx, "different", "other"); ok {
+	if _, ok, _ := r.FindDuplicate(ctx, hash("different"), "other"); ok {
 		t.Error("a receipt must not be its own duplicate")
 	}
 }
@@ -166,6 +171,29 @@ func testPendingReceipts(t *testing.T, r repository.Repository) {
 	ids, err := r.PendingReceipts(ctx)
 	if err != nil || fmt.Sprint(ids) != "[b a c]" {
 		t.Fatalf("pending = %v %v, want oldest first [b a c]", ids, err)
+	}
+}
+
+// Timestamps within the same second must still order correctly. A text column
+// holding RFC3339Nano gets this wrong ("09:00:00Z" sorts after "09:00:00.1Z").
+func testSubSecondOrdering(t *testing.T, r repository.Repository) {
+	mustCreate(t, r, receipt("later", t0.Add(100*time.Millisecond), "same"))
+	mustCreate(t, r, receipt("first", t0, "same"))
+	mustCreate(t, r, receipt("probe", t0.Add(time.Second), "same"))
+	for _, id := range []string{"later", "first"} {
+		r.MarkProcessing(ctx, id)
+	}
+	if ids, err := r.PendingReceipts(ctx); err != nil || fmt.Sprint(ids) != "[first later]" {
+		t.Errorf("pending = %v %v, want [first later]", ids, err)
+	}
+	if id, _, err := r.FindDuplicate(ctx, hash("same"), "probe"); err != nil || id != "first" {
+		t.Errorf("duplicate = %q %v, want the oldest (first)", id, err)
+	}
+
+	r.SaveProcessed(ctx, ocrRun("o_old", "first", t0), sampleTxn("t1", "first", t0))
+	r.SaveProcessed(ctx, ocrRun("o_new", "first", t0.Add(500*time.Millisecond)), sampleTxn("t1", "first", t0))
+	if o, err := r.LatestOCR(ctx, "first"); err != nil || o.ID != "o_new" {
+		t.Errorf("latest OCR = %q %v, want o_new", o.ID, err)
 	}
 }
 
@@ -350,3 +378,68 @@ func testConcurrentClaim(t *testing.T, r repository.Repository) {
 		t.Fatalf("%d goroutines claimed the same receipt, want 1", winners)
 	}
 }
+
+// A transaction is read as one aggregate: the version (the ETag) always matches the
+// items returned, even while another goroutine keeps replacing them.
+func testReadDuringWrite(t *testing.T, r repository.Repository) {
+	mustCreate(t, r, receipt("r1", t0, "a"))
+	r.SaveProcessed(ctx, ocrRun("o1", "r1", t0), sampleTxn("t1", "r1", t0))
+	// Each write stores one item whose description is the version it produces.
+	itemsFor := func(v int) []domain.LineItem {
+		return []domain.LineItem{{ID: "li" + strconv.Itoa(v), Description: strconv.Itoa(v), Amount: 1785, Source: domain.SourceUser}}
+	}
+	if err := r.ReplaceItems(ctx, "t1", 1, itemsFor(2), domain.ItemizeComplete, nil, t0); err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for v := 2; v < 200; v++ {
+			if err := r.ReplaceItems(ctx, "t1", v, itemsFor(v+1), domain.ItemizeComplete, nil, t0); err != nil {
+				t.Error(err)
+				return
+			}
+		}
+	}()
+	for {
+		select {
+		case <-done:
+			return
+		default:
+		}
+		got, err := r.GetTransaction(ctx, "t1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(got.LineItems) != 1 || got.LineItems[0].Description != strconv.Itoa(got.Version) {
+			<-done
+			t.Fatalf("torn read: version %d with items %+v", got.Version, got.LineItems)
+		}
+	}
+}
+
+// A transaction ID already used by another receipt is refused, and nothing changes
+// (SQLite enforces this with the primary key; memory must behave the same).
+func testTxnIDCollision(t *testing.T, r repository.Repository) {
+	mustCreate(t, r, receipt("r1", t0, "a"))
+	mustCreate(t, r, receipt("r2", t0, "b"))
+	if _, err := r.SaveProcessed(ctx, ocrRun("o1", "r1", t0), sampleTxn("tX", "r1", t0)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.SaveProcessed(ctx, ocrRun("o2", "r2", t0), sampleTxn("tX", "r2", t0)); err == nil {
+		t.Fatal("a second receipt was saved under an existing transaction id")
+	}
+	if got, err := r.GetTransaction(ctx, "tX"); err != nil || got.ReceiptID != "r1" {
+		t.Fatalf("existing transaction damaged: %+v %v", got, err)
+	}
+	if _, ok, _ := r.TransactionIDForReceipt(ctx, "r2"); ok {
+		t.Fatal("the rejected save left a transaction for r2")
+	}
+	if got, _ := r.GetReceipt(ctx, "r2"); got.Status != domain.ReceiptUploaded {
+		t.Fatalf("the rejected save changed r2's status to %s", got.Status)
+	}
+}
+
+// hash pads a short label to the 64 hex characters of a real SHA-256.
+func hash(label string) string { return strings.Repeat("0", 64-len(label)) + label }

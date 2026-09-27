@@ -28,6 +28,7 @@ type Receipts interface {
 	MarkReceiptFailed(ctx context.Context, id, reason string, at time.Time) error
 	// MarkProcessing atomically claims a receipt for processing. claimed is false
 	// when it was already PROCESSING, so duplicate requests collapse into one job.
+	// It leaves ocr_error alone, so RestoreStatus fully undoes a claim.
 	MarkProcessing(ctx context.Context, id string) (prev domain.ReceiptStatus, claimed bool, err error)
 	// RestoreStatus undoes MarkProcessing when the job could not be queued.
 	RestoreStatus(ctx context.Context, id string, status domain.ReceiptStatus) error
