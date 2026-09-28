@@ -49,6 +49,81 @@ receipts 1 ── 1 transactions         UNIQUE(receipt_id): one transaction per
 | No lost updates | `UPDATE … WHERE version = ?`; a stale `If-Match` returns 412, and a lost race without one returns 409 |
 | File type is trusted from the bytes, not the header | `http.DetectContentType` together with an allow-list |
 
+## Repository layer
+
+The service depends only on `repository.Repository`, an interface grouping `Receipts`, `OCRResults` and `Transactions`. It never imports a database package. Two implementations ship:
+
+- `repository/sqlite`, the default, with foreign keys, a UNIQUE constraint, CHECK constraints and a SQL transaction per write.
+- `repository/memory`, a mutex-guarded in-memory store (`make run-memory`). It proves the boundary is real, and it's handy for tests.
+
+`repository/repotest` is the **contract suite**: 15 tests covering round trips, one transaction per receipt, in-place re-process, optimistic locking, atomic claim, crash-recovery ordering, sub-second timestamp ordering, reads during concurrent writes (no torn aggregates), transaction-ID collisions, isolation of returned values and concurrent writers. Both implementations run it, and `make test` also runs the whole HTTP suite against each backend. To add Postgres or DynamoDB, write a package that passes `repotest.Run` and add a case to `openRepository` in `cmd/server`. Nothing else changes.
+
+Transaction is treated as an aggregate: its header, taxes and items are always read and written together (`SaveProcessed`, `ReplaceItems`), so a backend can't leave half a transaction behind.
+
+## Async processing
+
+With the stub, OCR is instant, so sync is the default and the brief's curls return the transaction directly. A real OCR or vision-model call takes seconds and sometimes fails, so `PROCESS_MODE=async` moves it off the request path:
+
+- `/process` atomically marks the receipt `PROCESSING` in the database and hands its ID to a buffered channel. A **fixed pool** of `OCR_WORKERS` goroutines reads the channel, which caps concurrent vendor calls.
+- Each attempt runs with a timeout. Transient errors are retried with exponential backoff; permanent ones (the file has no readable text) fail at once and mark the receipt `OCR_FAILED`.
+- **The database is the durable queue, and the channel is only a hand-off.** On startup, every receipt still in `PROCESSING` (left by a crash or an unfinished shutdown) is re-queued.
+- **The save is idempotent** (an upsert on `receipt_id`), so a job that runs twice still yields one transaction. A duplicate `/process` call doesn't queue a second job, because claiming the receipt is a conditional `UPDATE … WHERE status <> 'PROCESSING'` (exactly one caller sees a row change, on any database). If recording a failed job itself fails (the database is down), the receipt stays `PROCESSING` until the next start, when recovery re-queues it. Claims have no lease on purpose: an expiring claim needs a fencing token carried with the job, or a stale job can overwrite newer results (a production follow-up).
+- **Backpressure:** a full queue returns `503` with `Retry-After` instead of blocking or starting unbounded goroutines.
+- **Graceful shutdown:** HTTP stops first, then workers finish the jobs they are running within the deadline. Queued jobs stay `PROCESSING` and resume on the next start.
+
+This scales within one process. With several API replicas, each would have its own in-memory channel, so the next step is an external queue (SQS or Kafka) with separate worker processes. The worker code doesn't change, because it already assumes at-least-once delivery.
+
+## Design patterns
+
+Each pattern is here because it solves a problem in this code, not for show.
+
+| Pattern | Where | What it buys |
+|---|---|---|
+| Repository | `internal/repository` | The service never sees a database; backends are swappable and share one contract suite |
+| Strategy (interfaces chosen at startup) | `ocr.Engine`, `repository.Repository`, `service.FileStore`; picked in `cmd/server` (`openRepository`) | Stub OCR today, a vendor or VLM tomorrow; SQLite or memory; local disk or S3 |
+| Decorator | `ocr.Chain` with `WithLogging`, `WithCache`, `WithTimeout` (`internal/ocr/middleware.go`) | Cross-cutting concerns around the vendor call without touching the engine or the service |
+| Command | PATCH operations (`internal/itemize/ops.go`) | Each op is its own type with `Execute` and its own accepted fields; a registry maps the wire name to it, so a new op is a new type, not a longer switch. The ops share one wire struct for decoding, so this is a light version of the pattern |
+| Adapter | `jobHandler` in `cmd/server` | Plugs `Service.RunJob`/`FailJob` into the generic `worker.Pool`; neither package imports the other |
+| Producer–consumer / worker pool | `internal/worker` | Bounded concurrency, backpressure, retries |
+| Chain of responsibility | HTTP middleware (`internal/api/middleware.go`) | Request ID, access log and panic recovery wrap every handler; the access log sits outside recovery so a panicking request is still logged |
+| Value object | `domain.Money`, `domain.Rate` | Exact integer arithmetic; parsing and JSON in one place |
+| Optimistic locking | `version` column, `ETag`/`If-Match` | No lost updates without holding locks |
+
+Considered and left out: a state machine for receipt status (almost every transition is legal, since a receipt can be re-processed from any state, so a table would add code and catch nothing), and Specification objects for reconciliation (three short rules read better as one function).
+
+## Decisions and assumptions
+
+- **Items are net.** An item amount excludes added-on tax, which matches `gold.json`. The reconciliation rule is `sum(items) + sum(non-inclusive taxes) == grand_total` with a tolerance of 1 cent. Inclusive taxes such as "incl. VAT" are already inside the prices, so they are not added.
+- **The tax-only receipt gets no fallback item.** Gold allows one item equal to the total, but an invented line is exactly what the brief warns against. It stays `NEEDS_REVIEW` with empty items, and the user adds the line through PATCH.
+- **The printed subtotal is checked at process time** (`SUBTOTAL_MISMATCH`) to catch OCR that dropped a line. It is not enforced on user edits, because the grand total is the invariant there.
+- **Re-itemize replaces user edits.** The brief says "replace line items". Every item carries `source` (`AUTO` or `USER`), so a client can warn before calling it, and can send `If-Match` so it never clobbers an edit it has not seen.
+- **Re-processing rebuilds the transaction too**, from a fresh OCR run, so it also replaces edited items. That is the point of re-processing (the OCR input changed), and the old OCR row is kept. A production version would require `If-Match` on `/process` once a transaction has `USER` items; it is left out here to keep `/process` a plain retryable command. If a re-process fails permanently, the receipt shows `OCR_FAILED` while its previous transaction stays readable and unchanged.
+- **No floats anywhere.** Money is int64 cents; anything finer than a cent is rejected rather than rounded, and two-decimal currencies are assumed (0- and 3-decimal currencies such as JPY and KWD would take their exponent from ISO 4217). Tax rates and quantities are exact decimals (value and power of ten), so 19.123% or 1.125 kg are kept as printed. Instants are stored as epoch milliseconds (UTC) and returned as ISO-8601; the receipt date is a plain `YYYY-MM-DD`. SQLite tables are `STRICT`.
+- **Dates** accept ISO and day-first `DD.MM.YYYY`. Ambiguous slash dates are left `null` rather than guessed.
+- **Beyond the fixtures, the parser also handles** tax lines written "Total VAT" or "19% VAT", German summary and payment lines (Summe, Zwischensumme, MwSt, Bar, Rückgeld), and tip or rounding lines, which count toward the total but not the printed subtotal. Amount sums are overflow-checked.
+
+## Layout
+
+```
+cmd/server          wiring, config, graceful shutdown
+internal/domain     Money, Rate, Receipt, Transaction, TaxLine, LineItem, statuses
+internal/ocr        Engine interface, StubEngine, decorators (timeout, cache, logging)
+internal/extract    OCR text -> header, taxes, proposed items (pure)
+internal/itemize    Reconcile rules + PATCH operations as commands (pure)
+internal/service    use cases: upload, process, re-itemize, patch (no HTTP, SQL, disk or pool imports)
+internal/storage    FileStore implementation: local disk (S3 would sit beside it)
+internal/id         prefixed random IDs
+internal/reqid      request ID in the context + slog handler that stamps it on every log line
+internal/repository persistence contract (interfaces + errors) the service depends on
+  ├─ sqlite         SQLite implementation, transactional writes, versioned migrations (migrations/*.sql)
+  ├─ memory         in-memory implementation
+  └─ repotest       contract test suite every implementation must pass
+internal/worker     bounded goroutine pool: retries, timeouts, graceful shutdown
+internal/api        HTTP handlers, error mapping, middleware; depends on the api.Service interface
+fixtures/task-a     brief fixtures + gold.json
+docs                architecture.pdf (for review) and its HTML source
+```
+
 ## Tradeoffs made for scope
 
 - **Processing is sync by default and async on request.** `PROCESS_MODE=async` returns `202` and runs OCR on a bounded goroutine pool. It includes per-attempt timeouts, retries with backoff for transient errors, and `503` backpressure when the queue is full. The database is the durable queue: receipts are marked `PROCESSING` before they are handed to the channel, and startup recovery re-queues any left behind. The pool is per process, so with several replicas the channel becomes SQS or Kafka and the workers become their own deployment. The job code stays the same because it is already idempotent.
